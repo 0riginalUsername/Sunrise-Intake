@@ -2,7 +2,7 @@ from datetime import datetime
 from PIL import Image
 from PIL.ExifTags import TAGS
 from PyQt5.QtWidgets import (
-    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QComboBox, QLineEdit,
+    QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QScrollArea, QSizePolicy, QProgressBar
 )
 from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
@@ -16,7 +16,14 @@ import glob
 import logging
 import urllib.request
 
-sensor_list = ["L2", "P1", "M3E", "R3Pro"]
+EXIF_MODEL_TO_SENSOR = {
+    "PMA2616": "R3Pro",      # R3Pro
+    "L2": "L2",              # L2
+    "M3E": "M3E",            # M3E
+    "ZenmuseP1": "P1",       # P1
+}
+
+DEFAULT_SENSOR_IF_NO_IMAGES = "R3ProMobile"
 
 # Timeout constant for subprocess calls (in seconds)
 SUBPROCESS_TIMEOUT = 1800
@@ -160,7 +167,7 @@ class ProcessingWorker(QThread):
                         }
                     }
                 }
-            elif self.sensor_choice == "R3Pro":
+            elif self.sensor_choice in ("R3Pro", "R3ProMobile"):
                 folder_structure = {
                     self.client: {self.project: {DATE_CURR: {self.sensor_choice: {}, "BaseData": {}, "Pix4D": {}}}}
                 }
@@ -188,7 +195,7 @@ class ProcessingWorker(QThread):
                 
                 self.copy_choice_to_ppk(sensor_folder_path, ppk_folder_path)
                 self.cleanup_ppk_folder(ppk_folder_path, date_folder_path)
-            elif self.sensor_choice == "R3Pro":
+            elif self.sensor_choice in ("R3Pro", "R3ProMobile"):
                 # R3Pro: Run convertToRinex once on base data in permanent BaseData folder, then copy converted files to each subfolder's POS/base
                 self.status_update.emit("Processing R3Pro base data...")
                 
@@ -885,9 +892,10 @@ class DataIntakeUI(QMainWindow):
                 background: #113e59;
                 border: 1px solid #ffd457;
                 border-radius: 6px;
+                color: #ffffff;
             }
             QMessageBox QLabel {
-                color: #ffd457;
+                color: #ffffff;
                 font-family: 'Segoe UI';
                 font-size: 12pt;
             }
@@ -913,7 +921,7 @@ class DataIntakeUI(QMainWindow):
         self.current_progress_label = None
         
         self.setWindowTitle("Data Intake")
-        self.setGeometry(100, 100, 1200, 1000)
+        self.set_initial_window_geometry()
         self.setStyleSheet("background-color: #113e59; color: #113e59;")
         
         # Set window icon to logo.png if available
@@ -923,6 +931,21 @@ class DataIntakeUI(QMainWindow):
         self.show_placeholder_popup()
         self.init_ui()
         self.load_last_folder()
+
+    def set_initial_window_geometry(self):
+        """Size the window to fit lower resolutions while keeping a comfortable default."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            avail = screen.availableGeometry()
+            width = min(1100, int(avail.width() * 0.9))
+            height = min(900, int(avail.height() * 0.9))
+            width = max(width, 900)
+            height = max(height, 700)
+            x = avail.x() + (avail.width() - width) // 2
+            y = avail.y() + (avail.height() - height) // 2
+            self.setGeometry(x, y, width, height)
+        else:
+            self.setGeometry(50, 50, 1100, 900)
 
     def show_placeholder_popup(self):
         from PyQt5.QtWidgets import QDialog
@@ -1003,19 +1026,19 @@ class DataIntakeUI(QMainWindow):
         self.base_file_drop = QLabel("Drop Base Data file(s) here or click to select")
         self.base_file_drop.setFont(QFont("Segoe UI", 12))
         self.base_file_drop.setStyleSheet(self.STYLE_LABEL_DROP)
-        self.base_file_drop.setFixedHeight(55)
-        self.base_file_drop.setFixedWidth(500)
+        self.base_file_drop.setFixedHeight(110)
         self.base_file_drop.setAcceptDrops(True)
         self.base_file_drop.setWordWrap(True)
         self.base_file_drop.mousePressEvent = self.choose_base_file_event
-        base_file_layout.addWidget(self.base_file_drop)
+        self.base_file_drop.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        base_file_layout.addWidget(self.base_file_drop, stretch=1)
         
         self.label5 = QLabel("Base data file not selected")
         self.label5.setFont(QFont("Segoe UI", 12))
         self.label5.setStyleSheet("color: #113e59; background: #eaf6fa; border: none; border-radius: 6px; padding: 5px; margin: 5px;")
-        self.label5.setFixedHeight(55)
-        self.label5.setFixedWidth(450)
-        base_file_layout.addWidget(self.label5)
+        self.label5.setFixedHeight(110)
+        self.label5.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        base_file_layout.addWidget(self.label5, stretch=1)
         
         self.basefile_clear_btn = QPushButton("Clear")
         self.basefile_clear_btn.setFont(QFont("Segoe UI", 10))
@@ -1024,15 +1047,38 @@ class DataIntakeUI(QMainWindow):
         base_file_layout.addWidget(self.basefile_clear_btn)
         scroll_layout.addLayout(base_file_layout)
 
+        # Base drop loading indicator
+        self.base_drop_busy = QProgressBar()
+        self.base_drop_busy.setRange(0, 0)  # indeterminate
+        self.base_drop_busy.setTextVisible(True)
+        self.base_drop_busy.setFormat("Processing base file drop...")
+        self.base_drop_busy.setStyleSheet(self.STYLE_PROGRESS_BAR)
+        self.base_drop_busy.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.base_drop_busy.setFixedHeight(28)
+        self.base_drop_busy.hide()
+        scroll_layout.addWidget(self.base_drop_busy)
+
         # --- Data source drag area ---
         self.drop_label = QLabel("Drop Source Data Folders Here")
         self.drop_label.setFont(QFont("Segoe UI", 12))
         self.drop_label.setStyleSheet(self.STYLE_LABEL_DROP_RIDGE)
-        self.drop_label.setFixedHeight(64)
+        self.drop_label.setFixedHeight(128)
         self.drop_label.setAcceptDrops(True)
+        self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         scroll_layout.addWidget(self.drop_label)
         self.drop_label.installEventFilter(self)
         self.base_file_drop.installEventFilter(self)
+
+        # Data source drop loading indicator
+        self.data_drop_busy = QProgressBar()
+        self.data_drop_busy.setRange(0, 0)  # indeterminate
+        self.data_drop_busy.setTextVisible(True)
+        self.data_drop_busy.setFormat("Processing source folder drop...")
+        self.data_drop_busy.setStyleSheet(self.STYLE_PROGRESS_BAR)
+        self.data_drop_busy.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        self.data_drop_busy.setFixedHeight(28)
+        self.data_drop_busy.hide()
+        scroll_layout.addWidget(self.data_drop_busy)
 
         # --- Data source folders list ---
         self.data_source_list_label = QLabel("No data source folders selected.")
@@ -1063,7 +1109,7 @@ class DataIntakeUI(QMainWindow):
         self.client_ent.setStyleSheet(self.STYLE_INPUT)
         self.client_ent.setFixedWidth(180)
         self.client_ent.hide()
-        self.client_ent.textChanged.connect(self.on_sensor_choice)
+        self.client_ent.textChanged.connect(self.update_ready_state)
         input_row.addWidget(self.client_ent)
 
         self.label4 = QLabel("Project:")
@@ -1077,24 +1123,8 @@ class DataIntakeUI(QMainWindow):
         self.project_ent.setStyleSheet(self.STYLE_INPUT)
         self.project_ent.setFixedWidth(180)
         self.project_ent.hide()
-        self.project_ent.textChanged.connect(self.on_sensor_choice)
+        self.project_ent.textChanged.connect(self.update_ready_state)
         input_row.addWidget(self.project_ent)
-
-        self.lbl = QLabel("Sensor type:")
-        self.lbl.setFont(QFont("Segoe UI", 12, QFont.Bold))
-        self.lbl.hide()
-        self.lbl.setStyleSheet(self.STYLE_LABEL_TRANSPARENT)
-        input_row.addWidget(self.lbl)
-        
-        self.dropdown = QComboBox()
-        self.dropdown.setFont(QFont("Segoe UI", 12))
-        self.dropdown.setStyleSheet(self.STYLE_INPUT)
-        self.dropdown.addItem("Select Sensor Type")  # Add placeholder item
-        self.dropdown.addItems(sensor_list)
-        self.dropdown.setCurrentIndex(0)  # Set the placeholder as the default
-        self.dropdown.currentIndexChanged.connect(self.on_sensor_choice)
-        self.dropdown.hide()
-        input_row.addWidget(self.dropdown)
         scroll_layout.addLayout(input_row)
         
         self.create_lbl = QLabel("✅ All fields selected — ready to create folders.")
@@ -1140,7 +1170,7 @@ class DataIntakeUI(QMainWindow):
     def choose_folder(self):
         folder = QFileDialog.getExistingDirectory(self, "Select 3dData Folder", "E:/Data")
         if not folder:
-            QMessageBox.warning(self, "Folder Required", "Please select a folder to continue.")
+            self.show_message(QMessageBox.Warning, "Folder Required", "Please select a folder to continue.")
             return
         self.selected_folder = folder
         self.folder_path_display.setText(folder)
@@ -1159,12 +1189,16 @@ class DataIntakeUI(QMainWindow):
 
     def on_base_file_drop(self, event):
         files = []
-        for url in event.mimeData().urls():
-            path = url.toLocalFile()
-            if os.path.isfile(path) and (path.lower().endswith(('.t02', '.t04')) or self.is_rinex_path(path)):
-                files.append(path)
-        if files:
-            self.add_base_files(files)
+        self.show_loading(self.base_drop_busy, "Processing base file drop...")
+        try:
+            for url in event.mimeData().urls():
+                path = url.toLocalFile()
+                if os.path.isfile(path) and (path.lower().endswith(('.t02', '.t04')) or self.is_rinex_path(path)):
+                    files.append(path)
+            if files:
+                self.add_base_files(files)
+        finally:
+            self.hide_loading(self.base_drop_busy)
 
     def add_base_files(self, files):
         """Add one or more base data files."""
@@ -1183,6 +1217,7 @@ class DataIntakeUI(QMainWindow):
             display_names = [os.path.basename(f) for f in self.base_data_paths]
             self.label5.setText(f"Selected files ({len(display_names)}): {', '.join(display_names)}")
             self.set_names()
+            self.update_ready_state()
         elif not self.base_data_paths:
             self.label5.setText("Base data file not selected")
 
@@ -1190,21 +1225,35 @@ class DataIntakeUI(QMainWindow):
         self.base_data_paths = []
         self.base_data_is_rinex = False
         self.label5.setText("Base data file not selected")
+        self.update_ready_state()
 
     def set_names(self):
         self.label3.show()
         self.client_ent.show()
         self.label4.show()
         self.project_ent.show()
-        self.lbl.show()
-        self.dropdown.show()
+        self.update_ready_state()
 
-    def on_sensor_choice(self):
-        client_name = self.client_ent.text()
-        project_name = self.project_ent.text()
-        sensor_choice = self.dropdown.currentText()
-        # Only show if all fields are filled AND at least one data source folder is present
-        if client_name and project_name and sensor_choice != "Select Sensor Type" and self.data_source_folders:
+    def show_loading(self, bar, text):
+        """Display an indeterminate loading bar with provided text."""
+        if not bar:
+            return
+        bar.setFormat(text)
+        bar.setRange(0, 0)  # indeterminate
+        bar.show()
+        QApplication.processEvents()
+
+    def hide_loading(self, bar):
+        """Hide the loading bar."""
+        if not bar:
+            return
+        bar.hide()
+        bar.setRange(0, 100)
+
+    def update_ready_state(self):
+        client_name = self.client_ent.text().strip()
+        project_name = self.project_ent.text().strip()
+        if client_name and project_name and self.data_source_folders and self.base_data_paths:
             self.create_lbl.show()
             self.create_btn.show()
         else:
@@ -1234,7 +1283,57 @@ class DataIntakeUI(QMainWindow):
         except Exception as e:
             print(f"Could not load last folder: {e}")
 
+    def find_first_image_path(self, folder):
+        """Return the first image path within the provided folder tree."""
+        for root_dir, _, files in os.walk(folder):
+            image_files = sorted(
+                f for f in files if f.lower().endswith((".jpg", ".jpeg", ".png"))
+            )
+            if image_files:
+                return os.path.join(root_dir, image_files[0])
+        return None
+
+    def get_image_camera_model(self, image_path):
+        """Extract the camera model from EXIF metadata for sensor detection."""
+        try:
+            with Image.open(image_path) as image:
+                exif_data = image._getexif()
+            if not exif_data:
+                return None
+            for tag_id, value in exif_data.items():
+                tag = TAGS.get(tag_id, tag_id)
+                if tag == "Model":
+                    return str(value).strip()
+        except Exception as e:
+            print(f"Error reading EXIF model from {image_path}: {e}")
+        return None
+
+    def detect_sensor_from_sources(self):
+        """
+        Detect sensor type by reading EXIF camera model from the first available image.
+        Returns (sensor_choice, image_path_used, exif_model).
+        """
+        image_path_used = None
+        exif_model = None
+
+        for folder in self.data_source_folders:
+            image_path_used = self.find_first_image_path(folder)
+            if image_path_used:
+                exif_model = self.get_image_camera_model(image_path_used)
+                break
+
+        if not image_path_used:
+            # Per reference: absence of images implies R3ProMobile
+            return DEFAULT_SENSOR_IF_NO_IMAGES, None, None
+
+        if not exif_model:
+            return None, image_path_used, None
+
+        sensor_choice = EXIF_MODEL_TO_SENSOR.get(exif_model)
+        return sensor_choice, image_path_used, exif_model
+
     def on_drop(self, event):
+        self.show_loading(self.data_drop_busy, "Processing source folder drop...")
         try:
             # Append dropped folders, skipping duplicates
             for url in event.mimeData().urls():
@@ -1258,14 +1357,16 @@ class DataIntakeUI(QMainWindow):
                 self.drop_label.setText(f"{len(self.data_source_folders)} folder(s) selected:")
                 self.data_source_list_label.setText("\n".join(self.data_source_folders))
                 self.data_source_list_label.show()
-                self.on_sensor_choice()  # Check if ready to show create button
+                self.update_ready_state()
             else:
                 self.data_source_list_label.setText("No data source folders selected.")
                 self.data_source_list_label.show()
-                QMessageBox.warning(self, "No Folders", "No valid data source folders dropped.")
+                self.show_message(QMessageBox.Warning, "No Folders", "No valid data source folders dropped.")
         except Exception as e:
-            QMessageBox.critical(self, "Error", f"An error occurred while processing dropped folders:\n{str(e)}")
+            self.show_message(QMessageBox.Critical, "Error", f"An error occurred while processing dropped folders:\n{str(e)}")
             self.data_source_folders = []
+        finally:
+            self.hide_loading(self.data_drop_busy)
 
     def get_folder_size(self, folder_path):
         total_size = 0
@@ -1287,29 +1388,43 @@ class DataIntakeUI(QMainWindow):
         self.data_source_list_label.setText("No data source folders selected.")
         self.data_source_list_label.hide()
         self.drop_label.setText("Drop Source Data Folders Here")
-        self.on_sensor_choice()  # Re-evaluate if create button should be shown
+        self.update_ready_state()
+
+    def show_message(self, icon, title, text):
+        """Show a styled message box with consistent colors."""
+        msg = QMessageBox(self)
+        msg.setIcon(icon)
+        msg.setWindowTitle(title)
+        msg.setText(text)
+        msg.setStyleSheet(self.STYLE_MESSAGEBOX)
+        msg.exec_()
 
     def start_create_subfolders_thread(self):
         # Validate inputs before starting processing
         if not self.selected_folder:
-            QMessageBox.warning(self, "No Folder", "Please choose a folder first.")
-            return
-        if not self.dropdown.currentText():
-            QMessageBox.warning(self, "No sensor selected", "Please pick a sensor type from dropdown")
+            self.show_message(QMessageBox.Warning, "No Folder", "Please choose a folder first.")
             return
         if not self.data_source_folders:
-            QMessageBox.warning(self, "No Data Sources", "Please select data source folders.")
+            self.show_message(QMessageBox.Warning, "No Data Sources", "Please select data source folders.")
             return
         if not self.base_data_paths:
-            QMessageBox.warning(self, "No Base File", "Please select at least one base data file.")
+            self.show_message(QMessageBox.Warning, "No Base File", "Please select at least one base data file.")
             return
             
         CLIENT = self.client_ent.text().strip()
         PROJECT = self.project_ent.text().strip()
-        choice = self.dropdown.currentText()
-        
         if not CLIENT or not PROJECT:
-            QMessageBox.warning(self, "Missing Information", "Please enter both client and project names.")
+            self.show_message(QMessageBox.Warning, "Missing Information", "Please enter both client and project names.")
+            return
+
+        # Detect sensor using EXIF metadata
+        sensor_choice, image_path_used, exif_model = self.detect_sensor_from_sources()
+        if not sensor_choice:
+            self.show_message(
+                QMessageBox.Critical,
+                "Sensor not detected",
+                "Could not determine the sensor from image metadata. Please verify the source images include EXIF Model data.",
+            )
             return
 
         # Disable the start button to prevent multiple simultaneous operations
@@ -1323,7 +1438,7 @@ class DataIntakeUI(QMainWindow):
             self.base_data_paths,
             CLIENT,
             PROJECT,
-            choice,
+            sensor_choice,
             self.base_data_is_rinex
         )
         
@@ -1336,6 +1451,14 @@ class DataIntakeUI(QMainWindow):
         
         # Start the worker thread
         self.processing_worker.start()
+        # Show a quick popup with detected sensor information for troubleshooting
+        detected_msg_parts = [f"Sensor detected: {sensor_choice}"]
+        if exif_model:
+            detected_msg_parts.append(f"EXIF Model: {exif_model}")
+        if image_path_used:
+            detected_msg_parts.append(f"Image used: {image_path_used}")
+        else:
+            detected_msg_parts.append("No images found; assumed R3ProMobile per reference.")
     
     def update_file_copy_progress(self, current, total, folder_name):
         """Update the file copying progress bar"""

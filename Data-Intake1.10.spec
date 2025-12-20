@@ -2,11 +2,11 @@
 
 
 a = Analysis(
-    ['Data-Intake1.01.py'],
+    ['Data-Intake1.10.py'],
     pathex=[],
     binaries=[],
     datas=[],
-    hiddenimports=[],
+    hiddenimports=['sip'],
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
@@ -35,5 +35,5 @@ exe = EXE(
     target_arch=None,
     codesign_identity=None,
     entitlements_file=None,
-    icon=['Intake-icon.ico'],
+    icon=['intake-icon.ico'],
 )

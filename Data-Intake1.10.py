@@ -5,7 +5,7 @@ from PyQt5.QtWidgets import (
     QApplication, QMainWindow, QWidget, QLabel, QPushButton, QLineEdit,
     QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QScrollArea, QSizePolicy, QProgressBar
 )
-from PyQt5.QtGui import QFont, QPalette, QColor, QIcon
+from PyQt5.QtGui import QFont, QPalette, QColor, QIcon, QBrush
 from PyQt5.QtCore import Qt, QMimeData, QUrl, QThread, pyqtSignal, QObject
 from PyQt5.QtMultimedia import QSound
 import sys
@@ -28,7 +28,32 @@ DEFAULT_SENSOR_IF_NO_IMAGES = "R3ProMobile"
 # Timeout constant for subprocess calls (in seconds)
 SUBPROCESS_TIMEOUT = 1800
 
+APP_VERSION = "Data Intake 1.12"
+APP_BUILD_DATE = "12/16/2025"
+
 logger = logging.getLogger("data_intake")
+
+
+def _safe_stream(preferred):
+    """Return a writable stream, falling back to __stderr__/__stdout__/devnull."""
+    if preferred and hasattr(preferred, "write"):
+        return preferred
+    if hasattr(sys, "__stderr__") and sys.__stderr__:
+        return sys.__stderr__
+    if hasattr(sys, "__stdout__") and sys.__stdout__:
+        return sys.__stdout__
+    return open(os.devnull, "w")
+
+
+ORIGINAL_STDOUT = _safe_stream(sys.stdout)
+ORIGINAL_STDERR = _safe_stream(sys.stderr)
+
+def ensure_std_streams():
+    """Ensure sys.stdout/sys.stderr are valid writable streams (PyInstaller -w sets them to None)."""
+    if sys.stderr is None:
+        sys.stderr = ORIGINAL_STDERR
+    if sys.stdout is None:
+        sys.stdout = ORIGINAL_STDOUT
 
 # Path to store last selected folder between sessions
 LAST_FOLDER_FILE = os.path.join(os.environ.get("APPDATA", os.getcwd()), "DataIntake_last_folder.txt")
@@ -47,7 +72,20 @@ class StreamToLogger:
         message = message.strip()
         if message:
             for line in message.splitlines():
-                self.logger.log(self.level, line.strip())
+                try:
+                    if self.logger.handlers:
+                        self.logger.log(self.level, line.strip())
+                    else:
+                        # Fallback to original stderr/stdout if logger is not configured
+                        target = ORIGINAL_STDERR if self.level >= logging.ERROR else ORIGINAL_STDOUT
+                        target.write(line + "\n")
+                except Exception:
+                    # Absolute fallback to avoid recursive logging failures
+                    try:
+                        target = _safe_stream(None)
+                        target.write(line + "\n")
+                    except Exception:
+                        pass
 
     def flush(self):
         pass
@@ -55,6 +93,10 @@ class StreamToLogger:
 
 def configure_logging(log_file_path):
     """Configure logging to write detailed steps and errors to a file."""
+    # Avoid recursion/noisy stderr failures when frozen without a console.
+    ensure_std_streams()
+    logging.raiseExceptions = False
+
     logger.setLevel(logging.DEBUG)
     logger.handlers.clear()
 
@@ -64,7 +106,8 @@ def configure_logging(log_file_path):
     file_handler.setFormatter(formatter)
     logger.addHandler(file_handler)
 
-    stream_handler = logging.StreamHandler()
+    stream_target = _safe_stream(sys.stderr)
+    stream_handler = logging.StreamHandler(stream_target)
     stream_handler.setFormatter(formatter)
     logger.addHandler(stream_handler)
 
@@ -269,6 +312,7 @@ class ProcessingWorker(QThread):
                 image_path = os.path.join(root_dir, image_files[0])
                 return image_path
         return None
+
     
     def get_image_date_taken(self, image_path):
         """Extract date from image EXIF data"""
@@ -295,6 +339,9 @@ class ProcessingWorker(QThread):
             for source_folder in data_source_folders
             for _, _, files in os.walk(source_folder)
         )
+
+        # Use a larger buffer for copy operations to reduce overhead
+        buffer_size = 4 * 1024 * 1024  # 4 MB
         
         current_file = 0
         for source_folder in data_source_folders:
@@ -328,13 +375,14 @@ class ProcessingWorker(QThread):
                         counter += 1
                     
                     try:
-                        shutil.copy2(source_file, dest_file)
+                        with open(source_file, "rb") as src_f, open(dest_file, "wb") as dst_f:
+                            shutil.copyfileobj(src_f, dst_f, length=buffer_size)
+                        shutil.copystat(source_file, dest_file, follow_symlinks=True)
                         files_copied += 1
                         current_file += 1
                         
-                        # Emit progress update every 25 files to reduce UI overhead
-                        if current_file % 25 == 0 or current_file == total_files_to_copy:
-                            self.file_copy_progress.emit(current_file, total_files_to_copy, source_folder_name)
+                        # Emit progress update for each file copied
+                        self.file_copy_progress.emit(current_file, total_files_to_copy, source_folder_name)
                     except Exception as e:
                         print(f"Failed to copy {source_file}: {e}")
         
@@ -386,8 +434,9 @@ class ProcessingWorker(QThread):
         for target_folder in base_data_targets:
             if self.should_stop:
                 break
-
             os.makedirs(target_folder, exist_ok=True)
+
+            buffer_size = 4 * 1024 * 1024  # 4 MB
 
             for source_path in valid_sources:
                 files_to_copy = self.collect_rinex_files(source_path) if self.base_data_is_rinex else [source_path]
@@ -395,7 +444,9 @@ class ProcessingWorker(QThread):
                     file_name = os.path.basename(file_path)
                     dest_file = os.path.join(target_folder, file_name)
                     try:
-                        shutil.copy2(file_path, dest_file)
+                        with open(file_path, "rb") as src_f, open(dest_file, "wb") as dst_f:
+                            shutil.copyfileobj(src_f, dst_f, length=buffer_size)
+                        shutil.copystat(file_path, dest_file, follow_symlinks=True)
                     except Exception as e:
                         print(f"Failed to copy base data to {dest_file}: {e}")
 
@@ -476,21 +527,21 @@ class ProcessingWorker(QThread):
                     norm_ext = "." + norm_ext[3:]
                 if norm_ext in (".o", ".obs"):
                     rinex_file_path = os.path.join(root_dir, file)
-                    print(f"✅ Found RINEX file: {rinex_file_path}")
+                    print(f"Found RINEX file: {rinex_file_path}")
                     break
             if rinex_file_path:
                 break
                 
         if rinex_file_path:
-            print(f"🚀 Calling L2_rename with file: {rinex_file_path}")
+            print(f"Calling L2_rename with file: {rinex_file_path}")
             self.L2_rename(rinex_file_path, os.path.join(date_folder_path, "L2"))
-            print("🚀 Running RTB processing after RINEX conversion...")
+            print("Running RTB processing after RINEX conversion...")
             image_dir = os.path.join(date_folder_path, "PPK")
             base_dir = os.path.join(ppk_folder_path, "BaseData")
             self.status_update.emit("Running RTB processing for L2...")
             self.run_rtb(image_dir, base_dir, ppk_folder_path)
         else:
-            print("⚠️ No RINEX .??o file found — skipping L2_rename and RTB.")
+            print("No RINEX .??o file found - skipping L2_rename and RTB.")
     
     def batch_convert_to_rinex(self, folder_path):
         print(f"Starting RINEX conversion in folder: {folder_path}")
@@ -526,7 +577,7 @@ class ProcessingWorker(QThread):
         # Create exif_C destination folder
         exif_c_dest = os.path.join(image_dir, "exif_C")
         os.makedirs(exif_c_dest, exist_ok=True)
-        print(f"📁 Created exif_C folder: {exif_c_dest}")
+        print(f"Created exif_C folder: {exif_c_dest}")
         
         # Determine RTB output directory
         rtb_dir = os.path.join(ppk_folder if ppk_folder else image_dir, "RTB")
@@ -546,7 +597,7 @@ class ProcessingWorker(QThread):
             print("No JPG files found in RTB output directory")
             return
         
-        print(f"📋 Found {total_jpg_files} JPG files to copy to exif_C folder")
+        print(f"Found {total_jpg_files} JPG files to copy to exif_C folder")
         
         # Copy files with progress tracking
         files_copied = 0
@@ -581,7 +632,7 @@ class ProcessingWorker(QThread):
                     break
             
             
-            print(f"✅ Successfully copied {files_copied} JPG files to exif_C folder: {exif_c_dest}")
+            print(f"Successfully copied {files_copied} JPG files to exif_C folder: {exif_c_dest}")
             
         except Exception as e:
             print(f"Error copying files to exif_C: {e}")
@@ -590,7 +641,13 @@ class ProcessingWorker(QThread):
         try:
             print(f"Starting RTB processing with image_dir={image_dir}, base_dir={base_dir}, ppk_folder={ppk_folder}")
             bfile = self.find_latest_with_year_suffix(base_dir, {".o", ".obs"})
-            nfile = self.find_latest_with_year_suffix(base_dir, {".n", ".nav"})
+            nav_candidates = self.collect_nav_files(base_dir)
+            print(f"NAV candidates detected: {nav_candidates}")
+            merge_needed = len(nav_candidates) > 1 and (len(self.base_data_paths) > 1 or self.base_data_is_rinex)
+            if merge_needed:
+                nfile = self.merge_nav_files(nav_candidates, base_dir)
+            else:
+                nfile = nav_candidates[0] if nav_candidates else None
             gfile = self.find_latest_with_year_suffix(base_dir, {".g"})
             ant_fname = self.extract_ant_filename(bfile)
             ant_atx = None
@@ -727,7 +784,65 @@ class ProcessingWorker(QThread):
             return files[-1] if files else None
         except Exception as e:
             print(f"Error finding latest file with pattern {glob_pattern}: {e}")
-    
+
+    def collect_nav_files(self, folder_path):
+        """Collect all NAV files (.n/.nav) in a folder, normalizing year-suffixed extensions."""
+        nav_exts = {".n", ".nav"}
+        nav_files = []
+        try:
+            for entry in os.scandir(folder_path):
+                if not entry.is_file():
+                    continue
+                ext = os.path.splitext(entry.name)[1].lower()
+                norm_ext = ext
+                if len(norm_ext) > 3 and norm_ext[1:3].isdigit():
+                    norm_ext = "." + norm_ext[3:]
+                if norm_ext in nav_exts:
+                    nav_files.append(entry.path)
+        except Exception as e:
+            print(f"Error collecting NAV files in {folder_path}: {e}")
+        # Drop any existing merged.nav to avoid triggering merge on a single real NAV
+        nav_files = [p for p in nav_files if os.path.basename(p).lower() != "merged.nav"]
+        # Deduplicate and sort by mtime
+        nav_files = sorted(set(nav_files), key=os.path.getmtime)
+        return nav_files
+
+    def merge_nav_files(self, nav_files, output_dir):
+        """
+        Merge multiple NAV RINEX files into a single file using REDToolBoxCLI merge-nav.
+        Returns path to merged file, or the single nav file if only one, or None on failure.
+        """
+        if not nav_files:
+            return None
+        if len(nav_files) == 1:
+            return nav_files[0]
+
+        cli = r"C:\\Program Files\\REDToolBox\\resources\\assets\\REDToolBoxCLI\\REDToolBoxCLI.exe"
+        merged_name = "merged.nav"
+        merged_path = os.path.join(output_dir, merged_name)
+
+        cmd = [
+            cli,
+            "merge-nav",
+            "--log-level", "normal",
+            "--output-dir", output_dir,
+            "--merged-file-name", merged_name,
+        ]
+        for nav in nav_files:
+            cmd.extend(["--nav-input-file", nav])
+
+        print(f"Merging NAV files -> {merged_path}")
+        try:
+            subprocess.run(cmd, check=True, timeout=SUBPROCESS_TIMEOUT)
+            if os.path.exists(merged_path):
+                print(f"NAV merge complete: {merged_path}")
+                return merged_path
+            print("NAV merge ran but merged file not found; using last NAV input instead.")
+        except Exception as e:
+            print(f"NAV merge failed: {e}")
+        # Fallback to the newest NAV file
+        return nav_files[-1]
+
     def find_latest_with_year_suffix(self, folder_path, target_exts):
         """
         Find the newest file whose extension matches target_exts, allowing two-digit year prefixes
@@ -815,15 +930,15 @@ class ProcessingWorker(QThread):
                 for file in files:
                     if file.lower().endswith('.pdf'):
                         pdf_path = os.path.join(root, file)
-                        print(f"🚀 Opening PDF: {pdf_path}")
+                        print(f"Opening PDF: {pdf_path}")
                         try:
                             os.startfile(pdf_path)
                             pdfs_opened += 1
                         except Exception as e:
-                            print(f"⚠️ Could not open PDF {pdf_path}: {e}")
+                            print(f"Could not open PDF {pdf_path}: {e}")
             
             if pdfs_opened > 0:
-                print(f"✅ Opened {pdfs_opened} PDF report(s)")
+                print(f"Opened {pdfs_opened} PDF report(s)")
             else:
                 print("No PDF files found in RTB output directory")
                 
@@ -843,8 +958,14 @@ class DataIntakeUI(QMainWindow):
         self.STYLE_LABEL_WARNING = "color: #D32F2F; background: #ffd457; border-radius: 6px; padding: 10px; margin: 10px;"
         self.STYLE_LABEL_SUCCESS = "color: #228B22; background: #eaf6fa; border-radius: 6px; padding: 5px; margin: 5px;"
         self.STYLE_LABEL_LIST = "background: #f8f8f8; border: 1px solid #ffd457; color: #113e59; border-radius: 6px; padding: 5px; margin: 5px;"
-        self.STYLE_LABEL_DROP = "background: #fffbe6; border: 2px dashed #ffd457; color: #113e59; border-radius: 6px; padding: 5px; margin: 5px;"
-        self.STYLE_LABEL_DROP_RIDGE = "background: #fffbe6; border: 2px ridge #ffd457; border-radius: 6px; color: #113e59; padding: 5px; margin: 5px;"
+        self.STYLE_LABEL_DROP = """
+            background-color: #fffbe6;
+            border: 2px dashed #ffd457;
+            color: #113e59;
+            border-radius: 6px;
+            padding: 5px;
+            margin: 5px;
+        """
         self.STYLE_LABEL_TRANSPARENT = "background: transparent; color: #eaf6fa; padding: 5px; margin: 5px;"
         self.STYLE_LABEL_PROGRESS = "color: #113e59; background: #eaf6fa; border: 1px solid #ffd457; border-radius: 6px; padding: 8px; margin: 5px;"
         
@@ -932,6 +1053,7 @@ class DataIntakeUI(QMainWindow):
         self.init_ui()
         self.load_last_folder()
 
+
     def set_initial_window_geometry(self):
         """Size the window to fit lower resolutions while keeping a comfortable default."""
         screen = QApplication.primaryScreen()
@@ -969,6 +1091,16 @@ class DataIntakeUI(QMainWindow):
         self.central_widget = QWidget()
         self.setCentralWidget(self.central_widget)
         main_layout = QVBoxLayout(self.central_widget)
+
+        # --- Version banner ---
+        header_layout = QHBoxLayout()
+        header_layout.setAlignment(Qt.AlignLeft)
+        self.version_label = QLabel(f"{APP_VERSION}  |  {APP_BUILD_DATE}")
+        self.version_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
+        self.version_label.setStyleSheet("color: #eaf6fa; background: transparent; padding: 4px;")
+        header_layout.addWidget(self.version_label, alignment=Qt.AlignLeft)
+        header_layout.addStretch()
+        main_layout.addLayout(header_layout)
 
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
@@ -1061,13 +1193,22 @@ class DataIntakeUI(QMainWindow):
         # --- Data source drag area ---
         self.drop_label = QLabel("Drop Source Data Folders Here")
         self.drop_label.setFont(QFont("Segoe UI", 12))
-        self.drop_label.setStyleSheet(self.STYLE_LABEL_DROP_RIDGE)
+        self.drop_label.setStyleSheet(self.STYLE_LABEL_DROP)
         self.drop_label.setFixedHeight(128)
         self.drop_label.setAcceptDrops(True)
         self.drop_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         scroll_layout.addWidget(self.drop_label)
         self.drop_label.installEventFilter(self)
         self.base_file_drop.installEventFilter(self)
+        try:
+            palette = self.drop_label.palette()
+            base_color = QColor("#fffbe6")
+            pattern_brush = QBrush(base_color, Qt.Dense3Pattern)
+            palette.setBrush(QPalette.Window, pattern_brush)
+            self.drop_label.setAutoFillBackground(True)
+            self.drop_label.setPalette(palette)
+        except Exception as e:
+            logger.exception(f"Failed to apply patterned background to drop_label: {e}")
 
         # Data source drop loading indicator
         self.data_drop_busy = QProgressBar()
@@ -1098,11 +1239,14 @@ class DataIntakeUI(QMainWindow):
         input_row = QHBoxLayout()
         input_row.setAlignment(Qt.AlignHCenter)
 
+        # Client row
+        client_row = QHBoxLayout()
+        client_row.setAlignment(Qt.AlignHCenter)
         self.label3 = QLabel("Client:")
         self.label3.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.label3.hide()
         self.label3.setStyleSheet(self.STYLE_LABEL_TRANSPARENT)
-        input_row.addWidget(self.label3)
+        client_row.addWidget(self.label3)
         
         self.client_ent = QLineEdit()
         self.client_ent.setFont(QFont("Segoe UI", 12))
@@ -1110,13 +1254,17 @@ class DataIntakeUI(QMainWindow):
         self.client_ent.setFixedWidth(180)
         self.client_ent.hide()
         self.client_ent.textChanged.connect(self.update_ready_state)
-        input_row.addWidget(self.client_ent)
+        client_row.addWidget(self.client_ent)
+        input_row.addLayout(client_row)
 
+        # Project row
+        project_row = QHBoxLayout()
+        project_row.setAlignment(Qt.AlignHCenter)
         self.label4 = QLabel("Project:")
         self.label4.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.label4.hide()
         self.label4.setStyleSheet(self.STYLE_LABEL_TRANSPARENT)
-        input_row.addWidget(self.label4)
+        project_row.addWidget(self.label4)
         
         self.project_ent = QLineEdit()
         self.project_ent.setFont(QFont("Segoe UI", 12))
@@ -1124,10 +1272,11 @@ class DataIntakeUI(QMainWindow):
         self.project_ent.setFixedWidth(180)
         self.project_ent.hide()
         self.project_ent.textChanged.connect(self.update_ready_state)
-        input_row.addWidget(self.project_ent)
+        project_row.addWidget(self.project_ent)
+        input_row.addLayout(project_row)
         scroll_layout.addLayout(input_row)
         
-        self.create_lbl = QLabel("✅ All fields selected — ready to create folders.")
+        self.create_lbl = QLabel("All fields selected - ready to create folders.")
         self.create_lbl.setFont(QFont("Segoe UI", 12, QFont.Bold))
         self.create_lbl.setStyleSheet(self.STYLE_LABEL_SUCCESS)
         self.create_lbl.hide()
@@ -1342,16 +1491,8 @@ class DataIntakeUI(QMainWindow):
                     # Skip if already added
                     if path in self.data_source_folders:
                         continue
-                    try:
-                        folder_size_bytes = self.get_folder_size(path)
-                        folder_size_mb = folder_size_bytes / (1024 * 1024)
-                        if folder_size_mb < 100:
-                            continue
-                        # Add new valid folder
-                        self.data_source_folders.append(path)
-                    except Exception as e:
-                        print(f"Error processing folder {path}: {e}")
-                        continue
+                    # Avoid deep size scanning to keep UI responsive; add directly
+                    self.data_source_folders.append(path)
                         
             if self.data_source_folders:
                 self.drop_label.setText(f"{len(self.data_source_folders)} folder(s) selected:")
@@ -1367,20 +1508,6 @@ class DataIntakeUI(QMainWindow):
             self.data_source_folders = []
         finally:
             self.hide_loading(self.data_drop_busy)
-
-    def get_folder_size(self, folder_path):
-        total_size = 0
-        try:
-            for dirpath, _, filenames in os.walk(folder_path):
-                for file in filenames:
-                    file_path = os.path.join(dirpath, file)
-                    try:
-                        total_size += os.path.getsize(file_path)
-                    except (OSError, FileNotFoundError):
-                        continue
-        except Exception as e:
-            print(f"Error calculating folder size for {folder_path}: {e}")
-        return total_size
 
     def clear_data_sources(self):
         """Clear all data source folders and update the UI"""
@@ -1626,11 +1753,11 @@ class DataIntakeUI(QMainWindow):
             for file in files:
                 if file.lower().endswith('.pdf'):
                     pdf_path = os.path.join(root, file)
-                    print(f"🚀 Opening PDF: {pdf_path}")
+                    print(f"Opening PDF: {pdf_path}")
                     try:
                         os.startfile(pdf_path)
                     except Exception as e:
-                        print(f"⚠️ Could not open PDF {pdf_path}: {e}")
+                        print(f"Could not open PDF {pdf_path}: {e}")
         
         # Play sound notification (wav file)
         try:

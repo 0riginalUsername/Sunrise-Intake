@@ -50,7 +50,7 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.1.1"
+    APP_VERSION = "Data Intake v2.1.2"
     APP_BUILD_DATE = "06/15/2026"
     
     # Paths
@@ -1910,6 +1910,7 @@ class DataIntakeUI(QMainWindow):
         self.epsg_h_input.setFont(QFont("Segoe UI", 11))
         self.epsg_h_input.setFixedWidth(100)
         self.epsg_h_input.setPlaceholderText("e.g. 6625")
+        self.epsg_h_input.textChanged.connect(self._update_ready_state)
         epsg_row.addWidget(self.epsg_h_input)
         epsg_h_search = QPushButton("\U0001f50d")
         epsg_h_search.setFixedWidth(40)
@@ -2184,15 +2185,16 @@ class DataIntakeUI(QMainWindow):
     def _update_ready_state(self):
         """Update UI based on readiness to process."""
         # Safety check - widgets may not exist during init
-        if not all([self.ready_label, self.start_btn, self.client_input, self.project_input]):
+        if not all([self.ready_label, self.start_btn, self.client_input, self.project_input, self.epsg_h_input]):
             return
-        
+
         # Use all() to get a proper boolean (not the last truthy value)
         ready = all([
             self.client_input.text().strip(),
             self.project_input.text().strip(),
             self.data_source_folders,
-            self.base_data_paths
+            self.base_data_paths,
+            self.epsg_h_input.text().strip(),
         ])
         self.ready_label.setVisible(ready)
         self.start_btn.setVisible(ready)
@@ -2343,6 +2345,14 @@ class DataIntakeUI(QMainWindow):
         project = self.project_input.text().strip()
         if not client or not project:
             self._show_message(QMessageBox.Warning, "Missing Info", "Enter client and project names.")
+            return
+
+        if not (self.epsg_h_input and self.epsg_h_input.text().strip()):
+            self._show_message(
+                QMessageBox.Warning, "Coordinate System Required",
+                "Please select a coordinate system (EPSG Horizontal) before starting intake.\n\n"
+                "Use the \U0001f50d button to look up your State Plane zone."
+            )
             return
 
         if (self.dji_terra_toggle and self.dji_terra_toggle.isChecked()

@@ -1,2 +1,0 @@
-cd Z:\Survey\UT_Scripts\PythonDev\Intake
-pyinstaller --onefile --name "Data-Intake1.01" --noconfirm --icon "Intake-icon.ico" Data-Intake1.01.py

@@ -1,4 +1,12 @@
 @echo off
 cd /d "%~dp0"
-pyinstaller --onefile --name "Data-Inktake-EDIT" --icon="Intake-icon.ico" --windowed "Data-Intake-PyQt5-CLEAN.py"
+REM Prompts for .py path. EXE name, icon, onefile, windowed from build_config.ini.
+where py >nul 2>nul && (py build.py & goto :done)
+where python >nul 2>nul && (python build.py & goto :done)
+echo Python not found in PATH.
+echo Add Python to PATH, or run from a terminal where "py" or "python" works.
+pause
+exit /b 1
+:done
+if errorlevel 1 pause
 

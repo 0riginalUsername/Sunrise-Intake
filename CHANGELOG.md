@@ -5,6 +5,9 @@ Entries below the marker are appended automatically by `build.py` on each releas
 
 <!-- BUILD-LOG -->
 ## v2.2 — 06/17/2026
+- Added .csv TLT detection and implementation
+
+## v2.2 — 06/17/2026
 - Added EPSG functinality project location adjustment, and small ui changes
 
 ## v2.1.2 — 06/15/2026

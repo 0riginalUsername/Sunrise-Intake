@@ -2477,13 +2477,17 @@ class DataIntakeUI(QMainWindow):
 
         epsg_code, zone_name = result
         self.epsg_h_input.setText(epsg_code)
-        self._show_message(
-            QMessageBox.Information, "Zone Detected",
+        msg = QMessageBox(self)
+        msg.setIcon(QMessageBox.Information)
+        msg.setWindowTitle("Zone Detected")
+        msg.setText(
             f"Source:  {source_desc}\n"
             f"Coords:  {lat:.5f}°N   {lon:.5f}°E\n\n"
             f"Zone:    {zone_name}\n"
             f"EPSG:    {epsg_code}"
         )
+        msg.setStyleSheet(Styles.MESSAGEBOX)
+        msg.exec_()
 
     def _on_data_drop(self, event):
         """Handle data source folder drop."""

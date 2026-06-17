@@ -21,9 +21,10 @@ from PyQt5.QtWidgets import (
     QVBoxLayout, QHBoxLayout, QFileDialog, QMessageBox, QScrollArea,
     QSizePolicy, QProgressBar, QDialog, QCheckBox,
     QTableWidget, QTableWidgetItem, QHeaderView,
+    QRadioButton, QButtonGroup, QToolTip,
 )
-from PyQt5.QtGui import QFont, QIcon, QPixmap
-from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer
+from PyQt5.QtGui import QFont, QIcon, QPixmap, QCursor
+from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEventLoop
 from PyQt5.QtMultimedia import QSound
 import configparser
 import sys
@@ -35,9 +36,12 @@ import logging
 import re
 import json
 import html
+import math
 
 from dataclasses import dataclass
 from typing import Optional, List, Dict, Tuple, Set, ClassVar
+
+import struct
 
 # Disable PIL decompression bomb warning for large drone images (L3 captures ~100MP)
 Image.MAX_IMAGE_PIXELS = None
@@ -50,8 +54,8 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.1.2"
-    APP_BUILD_DATE = "06/15/2026"
+    APP_VERSION = "Data Intake v2.2"
+    APP_BUILD_DATE = "06/17/2026"
     
     # Paths
     LAST_FOLDER_FILE = os.path.join(
@@ -64,7 +68,8 @@ class Config:
     SOUND_PATH = r"Z:\Survey\UT\_GabeA\PanoSandbox\super_mario.wav"
     # Placeholder path applied when secret password is typed in the window
     SOUND_PATH_SECRET = r"Z:\Survey\UT\_GabeA\PanoSandbox\RickAstley-NeverGonnaGiveYouUp.wav"
-    
+    STATEPLANE_SHAPEFILE = r"Z:/Survey/UT/_Scripts/SunrisePhoto/resources/NAD83SPCEPSG.shp"
+
     # External tools
     CONVERT_TO_RINEX_EXE = r"C:\Program Files (x86)\Trimble\convertToRINEX\convertToRinex.exe"
     RTB_CLI_EXE = r"C:\Program Files\REDToolBox\resources\assets\REDToolBoxCLI\REDToolBoxCLI.exe"
@@ -510,6 +515,205 @@ class FileOperations:
     def is_rinex_file(path: str) -> bool:
         """Check if file is a RINEX file based on extension."""
         return path.lower().endswith(Config.RINEX_EXTENSIONS)
+
+
+# =============================================================================
+# COORDINATE UTILITIES - GPS extraction and State Plane zone lookup
+# =============================================================================
+
+def _ecef_to_geodetic(x: float, y: float, z: float) -> Tuple[float, float]:
+    """Convert ECEF (meters) to (lat_deg, lon_deg) using iterative WGS84."""
+    a = 6378137.0
+    e2 = 0.00669437999014
+    lon = math.degrees(math.atan2(y, x))
+    p = math.sqrt(x ** 2 + y ** 2)
+    lat = math.degrees(math.atan2(z, p * (1 - e2)))
+    for _ in range(10):
+        sin_lat = math.sin(math.radians(lat))
+        N = a / math.sqrt(1 - e2 * sin_lat ** 2)
+        lat = math.degrees(math.atan2(z + e2 * N * sin_lat, p))
+    return lat, lon
+
+
+def _gps_from_image(image_path: str) -> Optional[Tuple[float, float]]:
+    """Extract (lat, lon) decimal degrees from image GPS EXIF. Returns None if unavailable."""
+    try:
+        with Image.open(image_path) as img:
+            exif_raw = img._getexif()
+        if not exif_raw:
+            return None
+        gps = exif_raw.get(34853)  # 34853 = GPSInfo IFD tag
+        if not gps or 2 not in gps or 4 not in gps:
+            return None
+
+        def _rat(v):
+            # (numerator, denominator) tuple — old Pillow rational format
+            if isinstance(v, tuple) and len(v) == 2:
+                return v[0] / v[1]
+            # IFDRational, plain int/float, or anything with __float__
+            return float(v)
+
+        def _scalar(vals):
+            """Return a single decimal-degree value from whatever EXIF hands back."""
+            # Standard DMS: 3-element sequence (degrees, minutes, seconds)
+            if hasattr(vals, '__len__') and len(vals) == 3:
+                return _rat(vals[0]) + _rat(vals[1]) / 60.0 + _rat(vals[2]) / 3600.0
+            # Single-element sequence (decimal degrees in a wrapper)
+            if hasattr(vals, '__len__') and len(vals) == 1:
+                return _rat(vals[0])
+            # Already a scalar rational or float
+            return _rat(vals)
+
+        def _to_deg(vals, ref):
+            deg = _scalar(vals)
+            return -deg if str(ref).upper() in ("S", "W") else deg
+
+        return _to_deg(gps[2], gps.get(1, "N")), _to_deg(gps[4], gps.get(3, "E"))
+    except Exception as e:
+        print(f"GPS EXIF read failed for {image_path}: {e}")
+        return None
+
+
+def _gps_from_rinex(rinex_path: str) -> Optional[Tuple[float, float]]:
+    """Parse APPROX POSITION XYZ from a RINEX obs file header; return (lat, lon)."""
+    try:
+        with open(rinex_path, "r", encoding="utf-8", errors="ignore") as fh:
+            for line in fh:
+                if "APPROX POSITION XYZ" in line:
+                    parts = line.split()
+                    return _ecef_to_geodetic(float(parts[0]), float(parts[1]), float(parts[2]))
+                if "END OF HEADER" in line:
+                    break
+    except Exception as e:
+        print(f"RINEX coordinate read failed for {rinex_path}: {e}")
+    return None
+
+
+def _gps_from_t02(t02_path: str) -> Optional[Tuple[float, float]]:
+    """Convert a T02/T04 to RINEX in a temp dir and extract APPROX POSITION XYZ."""
+    import tempfile
+    if not os.path.isfile(Config.CONVERT_TO_RINEX_EXE):
+        print(f"convertToRINEX.exe not found — cannot extract coords from T02")
+        return None
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            tmp_src = os.path.join(tmp, os.path.basename(t02_path))
+            shutil.copy2(t02_path, tmp_src)
+            run_subprocess(
+                [Config.CONVERT_TO_RINEX_EXE, tmp_src],
+                capture_output=True,
+                timeout=120,
+            )
+            for root, _, files in os.walk(tmp):
+                for fname in files:
+                    norm_ext = FileOperations.normalize_extension(
+                        os.path.splitext(fname)[1].lower()
+                    )
+                    if norm_ext in (".o", ".obs"):
+                        result = _gps_from_rinex(os.path.join(root, fname))
+                        if result:
+                            return result
+    except Exception as e:
+        print(f"T02 GPS extraction failed for {t02_path}: {e}")
+    return None
+
+
+def _shp_polygons(shp_path: str) -> List[List[List[Tuple[float, float]]]]:
+    """Parse polygon rings from a .shp binary (shape types 5/15/25).
+    Returns one list-of-rings per record; empty list for non-polygon records."""
+    result = []
+    with open(shp_path, "rb") as fh:
+        fh.read(100)  # file header
+        while True:
+            hdr = fh.read(8)
+            if len(hdr) < 8:
+                break
+            rec_bytes = struct.unpack(">i", hdr[4:])[0] * 2  # content length in 16-bit words
+            data = fh.read(rec_bytes)
+            if len(data) < 4:
+                break
+            stype = struct.unpack("<i", data[:4])[0]
+            if stype not in (5, 15, 25, 31):  # Polygon / PolygonZ / PolygonM / MultiPatch
+                result.append([])
+                continue
+            n_parts, n_pts = struct.unpack("<ii", data[36:44])
+            parts = list(struct.unpack(f"<{n_parts}i", data[44:44 + 4 * n_parts]))
+            # MultiPatch (31) has a PartTypes int32 array after Parts before Points
+            base = 44 + 4 * n_parts + (4 * n_parts if stype == 31 else 0)
+            flat = struct.unpack(f"<{n_pts * 2}d", data[base:base + n_pts * 16])
+            pts = [(flat[i * 2], flat[i * 2 + 1]) for i in range(n_pts)]
+            parts.append(n_pts)  # sentinel for slicing
+            result.append([pts[parts[i]:parts[i + 1]] for i in range(n_parts)])
+    return result
+
+
+def _dbf_rows(dbf_path: str, want: Set[str]) -> List[Optional[Dict[str, str]]]:
+    """Read selected field values from a .dbf file."""
+    rows: List[Optional[Dict[str, str]]] = []
+    with open(dbf_path, "rb") as fh:
+        fh.read(4)                                          # version + date
+        n_recs = struct.unpack("<I", fh.read(4))[0]
+        hdr_sz = struct.unpack("<H", fh.read(2))[0]
+        rec_sz = struct.unpack("<H", fh.read(2))[0]
+        fh.read(20)                                         # reserved
+        fields: List[Tuple[str, int]] = []
+        while True:
+            desc = fh.read(32)
+            if not desc or desc[0] in (0x0D, 0x1A):        # terminator / EOF
+                break
+            name = desc[:11].rstrip(b"\x00").decode("ascii", errors="replace")
+            fields.append((name, desc[16]))                 # (field_name, field_length)
+        fh.seek(hdr_sz)
+        for _ in range(n_recs):
+            raw = fh.read(rec_sz)
+            if not raw:
+                break
+            if raw[0] == 0x2A:                              # deleted record
+                rows.append(None)
+                continue
+            d: Dict[str, str] = {}
+            off = 1                                         # skip deletion flag
+            for name, length in fields:
+                val = raw[off:off + length].decode("ascii", errors="replace").strip()
+                if name in want:
+                    d[name] = val
+                off += length
+            rows.append(d)
+    return rows
+
+
+def _ray_cast(px: float, py: float, ring: List[Tuple[float, float]]) -> bool:
+    """Even-odd ray casting: True if point (px, py) is inside the closed ring."""
+    inside = False
+    j = len(ring) - 1
+    for i, (xi, yi) in enumerate(ring):
+        xj, yj = ring[j]
+        if (yi > py) != (yj > py):
+            if px < (xj - xi) * (py - yi) / (yj - yi) + xi:
+                inside = not inside
+        j = i
+    return inside
+
+
+def _epsg_from_latlon(lat: float, lon: float) -> Optional[Tuple[str, str]]:
+    """Query the State Plane shapefile with no third-party dependencies.
+    Handles multipart polygons and holes via even-odd rule across all rings."""
+    shp_path = Config.STATEPLANE_SHAPEFILE
+    dbf_path = os.path.splitext(shp_path)[0] + ".dbf"
+    if not os.path.isfile(shp_path) or not os.path.isfile(dbf_path):
+        return None
+    try:
+        polys = _shp_polygons(shp_path)
+        attrs = _dbf_rows(dbf_path, {"EPSG", "ZONENAME"})
+        for rings, attr in zip(polys, attrs):
+            if not attr or not rings:
+                continue
+            hits = sum(1 for ring in rings if _ray_cast(lon, lat, ring))
+            if hits % 2 == 1:
+                return str(int(float(attr["EPSG"]))), attr["ZONENAME"]
+    except Exception as e:
+        print(f"State Plane shapefile lookup failed: {e}")
+    return None
 
 
 # =============================================================================
@@ -1056,6 +1260,19 @@ class ExifRtkScanThread(QThread):
     def run(self):
         agg, per = FlightPhotoExifAnalyzer.scan_rtk_flags_per_folder(self._folders)
         self.scan_finished.emit(self._generation, agg, per)
+
+
+class T02CoordThread(QThread):
+    """Converts a T02/T04 to RINEX in a temp dir and extracts GPS coordinates off the GUI thread."""
+
+    result_ready = pyqtSignal(object)  # emits (lat, lon) tuple or None
+
+    def __init__(self, t02_path: str):
+        super().__init__()
+        self._path = t02_path
+
+    def run(self):
+        self.result_ready.emit(_gps_from_t02(self._path))
 
 
 # =============================================================================
@@ -1899,34 +2116,63 @@ class DataIntakeUI(QMainWindow):
         gcp_row.addWidget(browse_btn)
         inner.addWidget(self._gcp_section)
 
-        # EPSG row
+        # EPSG row — label+input pairs are sub-grouped so the label sits flush against its field
         epsg_row = QHBoxLayout()
         epsg_row.setAlignment(Qt.AlignHCenter)
+        epsg_row.setSpacing(6)
+
+        epsg_h_pair = QHBoxLayout()
+        epsg_h_pair.setSpacing(3)
         epsg_h_label = QLabel("EPSG Horizontal:")
         epsg_h_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
         epsg_h_label.setStyleSheet("color: #113e59; background: transparent;")
-        epsg_row.addWidget(epsg_h_label)
+        epsg_h_pair.addWidget(epsg_h_label)
         self.epsg_h_input = QLineEdit()
         self.epsg_h_input.setFont(QFont("Segoe UI", 11))
         self.epsg_h_input.setFixedWidth(100)
         self.epsg_h_input.setPlaceholderText("e.g. 6625")
         self.epsg_h_input.textChanged.connect(self._update_ready_state)
-        epsg_row.addWidget(self.epsg_h_input)
+        epsg_h_pair.addWidget(self.epsg_h_input)
+        epsg_row.addLayout(epsg_h_pair)
+
         epsg_h_search = QPushButton("\U0001f50d")
         epsg_h_search.setFixedWidth(40)
         epsg_h_search.setFont(QFont("Segoe UI", 9))
-        epsg_h_search.setToolTip("Search EPSG horizontal codes")
         epsg_h_search.clicked.connect(self._open_epsg_lookup)
         epsg_row.addWidget(epsg_h_search)
+        epsg_row.addWidget(self._make_help_btn("Search EPSG horizontal codes"))
+
+        epsg_detect_btn = QPushButton("Auto-Detect")
+        epsg_detect_btn.setFont(QFont("Segoe UI", 9))
+        epsg_detect_btn.setSizePolicy(QSizePolicy.Minimum, QSizePolicy.Fixed)
+        epsg_detect_btn.setContentsMargins(8, 0, 8, 0)
+        epsg_detect_btn.clicked.connect(self._auto_detect_epsg)
+        epsg_row.addWidget(epsg_detect_btn)
+        epsg_row.addWidget(self._make_help_btn("Auto-detect State Plane zone from the selected GPS source"))
+
+        self.epsg_src_image = QRadioButton("Image")
+        self.epsg_src_image.setFont(QFont("Segoe UI", 9))
+        self.epsg_src_image.setChecked(True)
+        epsg_row.addWidget(self.epsg_src_image)
+        self.epsg_src_base = QRadioButton("Base File")
+        self.epsg_src_base.setFont(QFont("Segoe UI", 9))
+        epsg_row.addWidget(self.epsg_src_base)
+        self._epsg_src_group = QButtonGroup(self)
+        self._epsg_src_group.addButton(self.epsg_src_image)
+        self._epsg_src_group.addButton(self.epsg_src_base)
+
+        epsg_v_pair = QHBoxLayout()
+        epsg_v_pair.setSpacing(3)
         epsg_v_label = QLabel("EPSG Vertical:")
         epsg_v_label.setFont(QFont("Segoe UI", 11, QFont.Bold))
         epsg_v_label.setStyleSheet("color: #113e59; background: transparent;")
-        epsg_row.addWidget(epsg_v_label)
+        epsg_v_pair.addWidget(epsg_v_label)
         self.epsg_v_input = QLineEdit()
         self.epsg_v_input.setFont(QFont("Segoe UI", 11))
         self.epsg_v_input.setFixedWidth(100)
         self.epsg_v_input.setText("6360")
-        epsg_row.addWidget(self.epsg_v_input)
+        epsg_v_pair.addWidget(self.epsg_v_input)
+        epsg_row.addLayout(epsg_v_pair)
         inner.addLayout(epsg_row)
 
         self.scroll_layout.addWidget(box)
@@ -1989,6 +2235,20 @@ class DataIntakeUI(QMainWindow):
         btn.setStyleSheet(style)
         return btn
     
+    @staticmethod
+    def _make_help_btn(tooltip_text: str) -> QPushButton:
+        btn = QPushButton("?")
+        btn.setFont(QFont("Segoe UI", 7, QFont.Bold))
+        btn.setFixedSize(16, 16)
+        btn.setStyleSheet(
+            "QPushButton { color: #113e59; background: #ffd457; border-radius: 8px;"
+            " border: none; padding: 0; font-weight: bold; }"
+            " QPushButton:pressed { background: #eaf6fa; }"
+        )
+        btn.setCursor(Qt.ArrowCursor)
+        btn.clicked.connect(lambda: QToolTip.showText(QCursor.pos(), tooltip_text))
+        return btn
+
     def _create_progress_bar(self, text: str) -> QProgressBar:
         """Create a hidden progress bar."""
         bar = QProgressBar()
@@ -2097,7 +2357,134 @@ class DataIntakeUI(QMainWindow):
             self.epsg_h_input.setText(dlg.selected_h_code)
             if dlg.selected_v_code:
                 self.epsg_v_input.setText(dlg.selected_v_code)
-    
+
+    def _run_t02_with_loading_popup(self, candidate: str) -> Optional[Tuple[float, float]]:
+        """Run T02/T04 → RINEX conversion in a background thread behind a loading dialog."""
+        result_holder: list = [None]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Converting Base File")
+        dlg.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        dlg.setModal(True)
+        dlg.setStyleSheet(Styles.DIALOG_SENSOR)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(12)
+
+        msg = QLabel(
+            f"Converting base file to RINEX…\n\n"
+            f"{os.path.basename(candidate)}\n\n"
+            "This may take up to 30 seconds."
+        )
+        msg.setFont(QFont("Segoe UI", 11))
+        msg.setAlignment(Qt.AlignCenter)
+        layout.addWidget(msg)
+
+        bar = QProgressBar()
+        bar.setRange(0, 0)  # indeterminate spinner
+        bar.setTextVisible(False)
+        bar.setFixedHeight(18)
+        bar.setStyleSheet(Styles.PROGRESS_BAR)
+        layout.addWidget(bar)
+
+        dlg.adjustSize()
+        dlg.show()
+        QApplication.processEvents()
+
+        loop = QEventLoop()
+        thread = T02CoordThread(candidate)
+
+        def _on_done(res):
+            result_holder[0] = res
+            loop.quit()
+
+        thread.result_ready.connect(_on_done)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        loop.exec_()
+
+        dlg.close()
+        return result_holder[0]
+
+    def _auto_detect_epsg(self):
+        """Auto-detect State Plane EPSG from GPS in a drone image or RINEX base file."""
+        if not os.path.isfile(Config.STATEPLANE_SHAPEFILE):
+            self._show_message(
+                QMessageBox.Warning, "Shapefile Not Found",
+                f"State Plane shapefile not found:\n{Config.STATEPLANE_SHAPEFILE}"
+            )
+            return
+
+        coords: Optional[Tuple[float, float]] = None
+        source_desc = ""
+
+        if self.epsg_src_image.isChecked():
+            if not self.data_source_folders:
+                self._show_message(QMessageBox.Warning, "No Source Data",
+                                   "Drop drone source folders first.")
+                return
+            img_path = None
+            for folder in self.data_source_folders:
+                img_path = FileOperations.find_first_image(folder)
+                if img_path:
+                    break
+            if not img_path:
+                self._show_message(QMessageBox.Warning, "No Images Found",
+                                   "No image files found in the selected source folders.")
+                return
+            coords = _gps_from_image(img_path)
+            source_desc = os.path.basename(img_path)
+            if not coords:
+                self._show_message(QMessageBox.Warning, "No GPS in Image",
+                                   f"Could not read GPS EXIF from:\n{img_path}")
+                return
+
+        else:  # Base File
+            if not self.base_data_paths:
+                self._show_message(QMessageBox.Warning, "No Base File",
+                                   "Select a base data file first.")
+                return
+            for candidate in self.base_data_paths:
+                c: Optional[Tuple[float, float]] = None
+                if FileOperations.is_rinex_file(candidate):
+                    c = _gps_from_rinex(candidate)
+                elif candidate.lower().endswith(Config.BASE_DATA_EXTENSIONS):
+                    c = self._run_t02_with_loading_popup(candidate)
+                if c:
+                    coords = c
+                    source_desc = os.path.basename(candidate)
+                    break
+            if not coords:
+                self._show_message(
+                    QMessageBox.Warning, "No Coordinates Found",
+                    "Could not extract GPS coordinates from the base file.\n\n"
+                    "• RINEX obs files require APPROX POSITION XYZ in the header\n"
+                    "• T02/T04 requires convertToRINEX.exe and may take ~30 seconds\n\n"
+                    "Try switching to the Image source."
+                )
+                return
+
+        lat, lon = coords
+        result = _epsg_from_latlon(lat, lon)
+        if not result:
+            self._show_message(
+                QMessageBox.Warning, "Zone Not Found",
+                f"No US State Plane zone found for:\n"
+                f"Lat {lat:.5f}°   Lon {lon:.5f}°\n\n"
+                "Coordinates may be outside State Plane coverage."
+            )
+            return
+
+        epsg_code, zone_name = result
+        self.epsg_h_input.setText(epsg_code)
+        self._show_message(
+            QMessageBox.Information, "Zone Detected",
+            f"Source:  {source_desc}\n"
+            f"Coords:  {lat:.5f}°N   {lon:.5f}°E\n\n"
+            f"Zone:    {zone_name}\n"
+            f"EPSG:    {epsg_code}"
+        )
+
     def _on_data_drop(self, event):
         """Handle data source folder drop."""
         try:
@@ -2542,7 +2929,7 @@ class DataIntakeUI(QMainWindow):
                 "--project-name",     f"{client}_{project}_{date}",
                 "--project-location", ppk_folder,
                 "--data-source",      dji_data_source,
-                "--terra-path",       ppk_folder,
+                "--terra-path",       terra_folder,
                 "--ppk-path",         ppk_folder,
             ]
             if epsg_h:    cmd.extend(["--epsg-h",    epsg_h])

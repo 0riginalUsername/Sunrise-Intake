@@ -4,6 +4,9 @@ All notable changes to the Data Intake application. Newest entries on top.
 Entries below the marker are appended automatically by `build.py` on each release.
 
 <!-- BUILD-LOG -->
+## v2.2 — 06/17/2026
+- Added EPSG functinality project location adjustment, and small ui changes
+
 ## v2.1.2 — 06/15/2026
 - Added epsg ui check
 

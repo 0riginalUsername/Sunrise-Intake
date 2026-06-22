@@ -4,6 +4,9 @@ All notable changes to the Data Intake application. Newest entries on top.
 Entries below the marker are appended automatically by `build.py` on each release.
 
 <!-- BUILD-LOG -->
+## v2.2.1 — 06/22/2026
+- Fixed EPSG auto-detect popup window bug
+
 ## v2.2 — 06/17/2026
 - Added .csv TLT detection and implementation
 

@@ -54,8 +54,8 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.2"
-    APP_BUILD_DATE = "06/17/2026"
+    APP_VERSION = "Data Intake v2.2.1"
+    APP_BUILD_DATE = "06/22/2026"
     
     # Paths
     LAST_FOLDER_FILE = os.path.join(
@@ -1275,6 +1275,55 @@ class T02CoordThread(QThread):
         self.result_ready.emit(_gps_from_t02(self._path))
 
 
+class EpsgDetectThread(QThread):
+    """Runs GPS extraction + State Plane shapefile lookup off the GUI thread.
+
+    Emits (lat, lon, epsg_code, zone_name, source_desc) on full success,
+    (lat, lon, None, None, source_desc) when coords found but no zone matched,
+    or None when GPS coordinates could not be extracted at all.
+    """
+
+    result_ready = pyqtSignal(object)
+
+    def __init__(self, use_image: bool, candidates: list, folders: list):
+        super().__init__()
+        self._use_image = use_image
+        self._candidates = candidates
+        self._folders = folders
+
+    def run(self):
+        coords = None
+        source_desc = ""
+        if self._use_image:
+            for folder in self._folders:
+                img_path = FileOperations.find_first_image(folder)
+                if img_path:
+                    coords = _gps_from_image(img_path)
+                    if coords:
+                        source_desc = os.path.basename(img_path)
+                    break
+        else:
+            for candidate in self._candidates:
+                c = None
+                if FileOperations.is_rinex_file(candidate):
+                    c = _gps_from_rinex(candidate)
+                elif candidate.lower().endswith(Config.BASE_DATA_EXTENSIONS):
+                    c = _gps_from_t02(candidate)
+                if c:
+                    coords = c
+                    source_desc = os.path.basename(candidate)
+                    break
+        if not coords:
+            self.result_ready.emit(None)
+            return
+        lat, lon = coords
+        epsg = _epsg_from_latlon(lat, lon)
+        if epsg:
+            self.result_ready.emit((lat, lon, epsg[0], epsg[1], source_desc))
+        else:
+            self.result_ready.emit((lat, lon, None, None, source_desc))
+
+
 # =============================================================================
 # PROCESSING WORKER MODULE - Background processing orchestration
 # =============================================================================
@@ -2415,46 +2464,74 @@ class DataIntakeUI(QMainWindow):
             )
             return
 
-        coords: Optional[Tuple[float, float]] = None
-        source_desc = ""
+        use_image = self.epsg_src_image.isChecked()
 
-        if self.epsg_src_image.isChecked():
+        if use_image:
             if not self.data_source_folders:
                 self._show_message(QMessageBox.Warning, "No Source Data",
                                    "Drop drone source folders first.")
                 return
-            img_path = None
-            for folder in self.data_source_folders:
-                img_path = FileOperations.find_first_image(folder)
-                if img_path:
-                    break
-            if not img_path:
-                self._show_message(QMessageBox.Warning, "No Images Found",
-                                   "No image files found in the selected source folders.")
-                return
-            coords = _gps_from_image(img_path)
-            source_desc = os.path.basename(img_path)
-            if not coords:
-                self._show_message(QMessageBox.Warning, "No GPS in Image",
-                                   f"Could not read GPS EXIF from:\n{img_path}")
-                return
-
-        else:  # Base File
+        else:
             if not self.base_data_paths:
                 self._show_message(QMessageBox.Warning, "No Base File",
                                    "Select a base data file first.")
                 return
-            for candidate in self.base_data_paths:
-                c: Optional[Tuple[float, float]] = None
-                if FileOperations.is_rinex_file(candidate):
-                    c = _gps_from_rinex(candidate)
-                elif candidate.lower().endswith(Config.BASE_DATA_EXTENSIONS):
-                    c = self._run_t02_with_loading_popup(candidate)
-                if c:
-                    coords = c
-                    source_desc = os.path.basename(candidate)
-                    break
-            if not coords:
+
+        # Loading dialog — mirrors _run_t02_with_loading_popup
+        result_holder: list = [None]
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Detecting EPSG")
+        dlg.setWindowFlags(Qt.Dialog | Qt.CustomizeWindowHint | Qt.WindowTitleHint)
+        dlg.setModal(True)
+        dlg.setStyleSheet(Styles.DIALOG_SENSOR)
+        layout = QVBoxLayout(dlg)
+        layout.setContentsMargins(24, 18, 24, 18)
+        layout.setSpacing(12)
+
+        src_label = "drone image GPS EXIF" if use_image else "base file coordinates"
+        lbl = QLabel(f"Detecting State Plane zone\nfrom {src_label}…\n\nThis may take a moment.")
+        lbl.setFont(QFont("Segoe UI", 11))
+        lbl.setAlignment(Qt.AlignCenter)
+        layout.addWidget(lbl)
+
+        bar = QProgressBar()
+        bar.setRange(0, 0)
+        bar.setTextVisible(False)
+        bar.setFixedHeight(18)
+        bar.setStyleSheet(Styles.PROGRESS_BAR)
+        layout.addWidget(bar)
+
+        dlg.adjustSize()
+        dlg.show()
+        QApplication.processEvents()
+
+        loop = QEventLoop()
+        thread = EpsgDetectThread(
+            use_image,
+            list(self.base_data_paths),
+            list(self.data_source_folders),
+        )
+
+        def _on_done(res):
+            result_holder[0] = res
+            loop.quit()
+
+        thread.result_ready.connect(_on_done)
+        thread.finished.connect(thread.deleteLater)
+        thread.start()
+        loop.exec_()
+
+        dlg.close()
+
+        detection = result_holder[0]
+        if detection is None:
+            if use_image:
+                self._show_message(
+                    QMessageBox.Warning, "No GPS in Image",
+                    "Could not read GPS EXIF from any image in the selected source folders."
+                )
+            else:
                 self._show_message(
                     QMessageBox.Warning, "No Coordinates Found",
                     "Could not extract GPS coordinates from the base file.\n\n"
@@ -2462,11 +2539,10 @@ class DataIntakeUI(QMainWindow):
                     "• T02/T04 requires convertToRINEX.exe and may take ~30 seconds\n\n"
                     "Try switching to the Image source."
                 )
-                return
+            return
 
-        lat, lon = coords
-        result = _epsg_from_latlon(lat, lon)
-        if not result:
+        lat, lon, epsg_code, zone_name, source_desc = detection
+        if epsg_code is None:
             self._show_message(
                 QMessageBox.Warning, "Zone Not Found",
                 f"No US State Plane zone found for:\n"
@@ -2475,7 +2551,6 @@ class DataIntakeUI(QMainWindow):
             )
             return
 
-        epsg_code, zone_name = result
         self.epsg_h_input.setText(epsg_code)
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)

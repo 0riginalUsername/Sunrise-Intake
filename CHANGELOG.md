@@ -4,6 +4,9 @@ All notable changes to the Data Intake application. Newest entries on top.
 Entries below the marker are appended automatically by `build.py` on each release.
 
 <!-- BUILD-LOG -->
+## v2.3.1 — 06/29/2026
+- Fixed vertical EPSG bug, added overried base position info support
+
 ## v2.2.1 — 06/22/2026
 - Fixed EPSG auto-detect popup window bug
 

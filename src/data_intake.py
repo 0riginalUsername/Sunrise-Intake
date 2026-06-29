@@ -27,6 +27,7 @@ from PyQt5.QtGui import QFont, QIcon, QPixmap, QCursor
 from PyQt5.QtCore import Qt, QThread, pyqtSignal, QTimer, QEventLoop
 from PyQt5.QtMultimedia import QSound
 import configparser
+import csv
 import sys
 import os
 import shutil
@@ -43,6 +44,8 @@ from typing import Optional, List, Dict, Tuple, Set, ClassVar
 
 import struct
 
+from classify_3dr import Classify3DRThread, Classify3DRWidget
+
 # Disable PIL decompression bomb warning for large drone images (L3 captures ~100MP)
 Image.MAX_IMAGE_PIXELS = None
 
@@ -54,8 +57,8 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.2.1"
-    APP_BUILD_DATE = "06/22/2026"
+    APP_VERSION = "Data Intake v2.3.1"
+    APP_BUILD_DATE = "06/29/2026"
     
     # Paths
     LAST_FOLDER_FILE = os.path.join(
@@ -574,6 +577,54 @@ def _gps_from_image(image_path: str) -> Optional[Tuple[float, float]]:
         return None
 
 
+_BASE_ECEF_EXPECTED_HEADERS: Tuple[str, ...] = ("Point ID", "X (ECEF)", "Y (ECEF)", "Z (ECEF)")
+
+
+def _parse_base_ecef_csv(path: str) -> Tuple[float, float, float]:
+    """Parse a corrected base position CSV and return (X, Y, Z) in metres.
+
+    Required format (BOM is tolerated):
+        Point ID,X (ECEF),Y (ECEF),Z (ECEF)
+        <name>,<X_m>,<Y_m>,<Z_m>
+
+    Raises ValueError with a user-readable message on any format mismatch.
+    """
+    try:
+        with open(path, newline="", encoding="utf-8-sig") as fh:
+            reader = csv.reader(fh)
+            try:
+                headers = tuple(h.strip() for h in next(reader))
+            except StopIteration:
+                raise ValueError("CSV file is empty.")
+            if headers != _BASE_ECEF_EXPECTED_HEADERS:
+                raise ValueError(
+                    f"Column headers do not match expected format.\n\n"
+                    f"  Found:    {list(headers)}\n"
+                    f"  Expected: {list(_BASE_ECEF_EXPECTED_HEADERS)}"
+                )
+            try:
+                row = next(reader)
+            except StopIteration:
+                raise ValueError("CSV has column headers but no data rows.")
+            if len(row) < 4:
+                raise ValueError(
+                    f"Data row has {len(row)} column(s); expected 4 "
+                    f"(Point ID, X, Y, Z)."
+                )
+            try:
+                x, y, z = float(row[1].strip()), float(row[2].strip()), float(row[3].strip())
+            except ValueError:
+                raise ValueError(
+                    f"X / Y / Z values must be numeric.\n"
+                    f"  Got: {row[1:4]}"
+                )
+            return x, y, z
+    except ValueError:
+        raise
+    except Exception as exc:
+        raise ValueError(f"Could not read CSV: {exc}") from exc
+
+
 def _gps_from_rinex(rinex_path: str) -> Optional[Tuple[float, float]]:
     """Parse APPROX POSITION XYZ from a RINEX obs file header; return (lat, lon)."""
     try:
@@ -1024,6 +1075,7 @@ class FolderStructureBuilder:
         "BaseData": {},
         "Pix4D": {},
         "Terra": {},
+        "PPK": {},
     }
     
     @classmethod
@@ -1090,40 +1142,86 @@ class RinexProcessor:
             print(f"Failed to rename mix files in {folder_path}: {e}")
     
     @staticmethod
-    def batch_convert(folder_path: str) -> None:
-        """Convert T02/T04 files to RINEX format."""
+    def batch_convert(
+        folder_path: str,
+        base_ecef_xyz: Optional[Tuple[float, float, float]] = None,
+    ) -> None:
+        """Convert T02/T04 files to RINEX format.
+
+        If base_ecef_xyz is provided the corrected ECEF position (X, Y, Z in
+        metres) is written into the APPROX POSITION XYZ field of every
+        converted RINEX observation file via the convertToRINEX -x/-y/-z flags.
+        """
         print(f"Starting RINEX conversion in folder: {folder_path}")
-        
+
         if not os.path.isdir(folder_path):
             print("Error: Folder path does not exist.")
             return
-        
+
         t_files = [
-            f for f in os.listdir(folder_path) 
+            f for f in os.listdir(folder_path)
             if f.lower().endswith((".t02", ".t04", "t0b"))
         ]
-        
+
         if not t_files:
             print("No .T02 or .T04 files found.")
             return
-        
+
         if not os.path.isfile(Config.CONVERT_TO_RINEX_EXE):
             print(f"Error: {Config.CONVERT_TO_RINEX_EXE} not found.")
             return
-        
+
         for file_name in t_files:
             try:
                 file_path = os.path.join(folder_path, file_name)
-                # Trimble convertToRINEX: just pass the file, it uses default RINEX version
+
                 command = [Config.CONVERT_TO_RINEX_EXE, file_path]
-                print(f"Converting: {file_name}")
+                if base_ecef_xyz is not None:
+                    x, y, z = base_ecef_xyz
+                    command.append(f"/xy:{x},{y},{z}")
+                    print(f"Base position override: X={x}  Y={y}  Z={z}")
                 print(f"Command: {' '.join(command)}")
                 run_subprocess(command, check=True, timeout=Config.SUBPROCESS_TIMEOUT)
+
+                if base_ecef_xyz is not None:
+                    RinexProcessor.patch_approx_position(folder_path, x, y, z)
+
                 RinexProcessor.rename_mix_to_nav(folder_path)
                 print(f"Successfully converted {file_name}")
             except Exception as e:
                 print(f"Error converting {file_name}: {e}")
     
+    @staticmethod
+    def patch_approx_position(folder_path: str, x: float, y: float, z: float) -> None:
+        """Overwrite the APPROX POSITION XYZ line in every RINEX obs file in folder_path."""
+        for fname in os.listdir(folder_path):
+            fpath = os.path.join(folder_path, fname)
+            if not os.path.isfile(fpath):
+                continue
+            ext = os.path.splitext(fname)[1].lower()
+            # RINEX obs files end in a digit + O (e.g. .26O) or .obs / .rnx
+            if not (ext.endswith("o") or ext in (".obs", ".rnx")):
+                continue
+            try:
+                with open(fpath, "r", encoding="utf-8", errors="ignore") as fh:
+                    lines = fh.readlines()
+                patched = False
+                for i, line in enumerate(lines):
+                    if "APPROX POSITION XYZ" in line:
+                        lines[i] = f"{x:14.4f}{y:14.4f}{z:14.4f}                  APPROX POSITION XYZ\n"
+                        patched = True
+                        break
+                    if "END OF HEADER" in line:
+                        break
+                if patched:
+                    with open(fpath, "w", encoding="utf-8") as fh:
+                        fh.writelines(lines)
+                    print(f"Patched APPROX POSITION XYZ in {fname}")
+                else:
+                    print(f"No APPROX POSITION XYZ found in {fname} — skipped")
+            except Exception as e:
+                print(f"Failed to patch {fname}: {e}")
+
     @staticmethod
     def collect_nav_files(folder_path: str) -> List[str]:
         """Collect all NAV files in a folder."""
@@ -1342,6 +1440,7 @@ class ProcessingWorker(QThread):
         self, selected_folder: str, data_source_folders: List[str],
         base_data_paths: List[str], client: str, project: str,
         sensor_choice: str, base_data_is_rinex: bool = False,
+        base_ecef_xyz: Optional[Tuple[float, float, float]] = None,
     ):
         super().__init__()
         self.selected_folder = selected_folder
@@ -1351,6 +1450,7 @@ class ProcessingWorker(QThread):
         self.project = project
         self.sensor_choice = sensor_choice
         self.base_data_is_rinex = base_data_is_rinex
+        self.base_ecef_xyz = base_ecef_xyz
         self.should_stop = False
         self.log_file_path = None
     
@@ -1570,7 +1670,7 @@ class ProcessingWorker(QThread):
             RinexProcessor.rename_mix_to_nav(base_folder)
         else:
             self.status_update.emit("Converting to RINEX format...")
-            RinexProcessor.batch_convert(base_folder)
+            RinexProcessor.batch_convert(base_folder, self.base_ecef_xyz)
     
     def _copy_to_ppk(self, sensor_folder: str, ppk_folder: str):
         """Copy sensor folder contents to PPK folder."""
@@ -1811,11 +1911,19 @@ class DataIntakeUI(QMainWindow):
         self._dji_box = None
         self._dji_details = None
         self._dji_thread = None
+        self._classify_3dr_widget = None
+        self._classify_3dr_thread = None
+        self._pending_3dr_terra_folder = None
         self.gcp_path_input = None
         self.epsg_h_input = None
         self.epsg_v_input = None
         self._gcp_section = None
-        
+        self._no_targets_check = None
+        self._manual_base_check = None
+        self._manual_base_csv_path: Optional[str] = None
+        self._manual_base_csv_label = None
+        self._manual_base_csv_browse_btn = None
+
         self._secret_password = "gabeisagenius"
         self._key_buffer = ""
         self._setup_window()
@@ -2028,7 +2136,35 @@ class DataIntakeUI(QMainWindow):
         # Loading indicator
         self.base_drop_busy = self._create_progress_bar("Processing base file drop...")
         self.scroll_layout.addWidget(self.base_drop_busy)
-        
+
+        # Manual base processing row
+        manual_row = QHBoxLayout()
+        manual_row.setAlignment(Qt.AlignLeft)
+
+        self._manual_base_check = QCheckBox("Manual base processing")
+        self._manual_base_check.setFont(QFont("Segoe UI", 11))
+        self._manual_base_check.setStyleSheet(
+            "QCheckBox { color: #eaf6fa; background: transparent; border: none; } "
+            "QCheckBox::indicator { width: 16px; height: 16px; }"
+        )
+        self._manual_base_check.toggled.connect(self._on_manual_base_toggled)
+        manual_row.addWidget(self._manual_base_check)
+
+        self._manual_base_csv_label = QLabel("No corrected base position CSV selected")
+        self._manual_base_csv_label.setFont(QFont("Segoe UI", 11))
+        self._manual_base_csv_label.setStyleSheet(
+            "color: #eaf6fa; background: transparent; border: none; padding: 2px;"
+        )
+        self._manual_base_csv_label.hide()
+        manual_row.addWidget(self._manual_base_csv_label, stretch=1)
+
+        self._manual_base_csv_browse_btn = self._create_button("Browse CSV", Styles.BUTTON_PRIMARY, 10)
+        self._manual_base_csv_browse_btn.clicked.connect(self._choose_base_ecef_csv)
+        self._manual_base_csv_browse_btn.hide()
+        manual_row.addWidget(self._manual_base_csv_browse_btn)
+
+        self.scroll_layout.addLayout(manual_row)
+
         self.base_file_drop.installEventFilter(self)
     
     def _add_data_source_section(self):
@@ -2140,11 +2276,27 @@ class DataIntakeUI(QMainWindow):
         toggle_row2.addWidget(self.dji_ppk_toggle)
         inner.addLayout(toggle_row2)
 
-        # GCP file row — only visible when LiDAR toggle is checked
+        # GCP section — only visible when LiDAR toggle is checked
         self._gcp_section = QWidget()
-        self._gcp_section.setStyleSheet("background: transparent;")
+        self._gcp_section.setStyleSheet("background: transparent; border: none;")
         self._gcp_section.setVisible(False)
-        gcp_row = QHBoxLayout(self._gcp_section)
+        gcp_vbox = QVBoxLayout(self._gcp_section)
+        gcp_vbox.setContentsMargins(0, 0, 0, 0)
+        gcp_vbox.setSpacing(4)
+
+        # "No Targets" toggle row
+        no_target_row = QHBoxLayout()
+        no_target_row.setAlignment(Qt.AlignHCenter)
+        self._no_targets_check = QCheckBox("No Targets (run without GCP file)")
+        self._no_targets_check.setFont(QFont("Segoe UI", 10))
+        self._no_targets_check.setStyleSheet("color: #113e59; border: none;")
+        no_target_row.addWidget(self._no_targets_check)
+        gcp_vbox.addLayout(no_target_row)
+
+        # GCP file row — hidden when No Targets is checked
+        self._gcp_file_row = QWidget()
+        self._gcp_file_row.setStyleSheet("background: transparent; border: none;")
+        gcp_row = QHBoxLayout(self._gcp_file_row)
         gcp_row.setContentsMargins(0, 0, 0, 0)
         gcp_row.setAlignment(Qt.AlignHCenter)
         gcp_label = QLabel("GCP File:")
@@ -2163,6 +2315,12 @@ class DataIntakeUI(QMainWindow):
         browse_btn.setFont(QFont("Segoe UI", 10))
         browse_btn.clicked.connect(self._browse_gcp_file)
         gcp_row.addWidget(browse_btn)
+        gcp_vbox.addWidget(self._gcp_file_row)
+
+        self._no_targets_check.stateChanged.connect(
+            lambda state: self._gcp_file_row.setVisible(not bool(state))
+        )
+
         inner.addWidget(self._gcp_section)
 
         # EPSG row — label+input pairs are sub-grouped so the label sits flush against its field
@@ -2223,6 +2381,17 @@ class DataIntakeUI(QMainWindow):
         epsg_v_pair.addWidget(self.epsg_v_input)
         epsg_row.addLayout(epsg_v_pair)
         inner.addLayout(epsg_row)
+
+        # 3DR auto-classification row — hidden until DJI Terra toggle is on
+        classify_row = QHBoxLayout()
+        classify_row.setAlignment(Qt.AlignHCenter)
+        self._classify_3dr_widget = Classify3DRWidget()
+        self._classify_3dr_widget.setVisible(False)
+        classify_row.addWidget(self._classify_3dr_widget)
+        inner.addLayout(classify_row)
+        self.dji_terra_toggle.stateChanged.connect(
+            lambda state: self._classify_3dr_widget.setVisible(bool(state))
+        )
 
         self.scroll_layout.addWidget(box)
 
@@ -2400,6 +2569,49 @@ class DataIntakeUI(QMainWindow):
             self.base_file_label.setText("Base data file not selected")
         self._update_ready_state()
 
+    def _on_manual_base_toggled(self, checked: bool):
+        """Show/hide the CSV picker row when the manual base checkbox changes."""
+        if self._manual_base_csv_label:
+            self._manual_base_csv_label.setVisible(checked)
+        if self._manual_base_csv_browse_btn:
+            self._manual_base_csv_browse_btn.setVisible(checked)
+        if not checked:
+            self._manual_base_csv_path = None
+            if self._manual_base_csv_label:
+                self._manual_base_csv_label.setText("No corrected base position CSV selected")
+                self._manual_base_csv_label.setStyleSheet(
+                    "color: #eaf6fa; background: transparent; border: none; padding: 2px;"
+                )
+
+    def _choose_base_ecef_csv(self):
+        """Open a file dialog for the corrected base position CSV and validate its format."""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Select Corrected Base Position CSV", "", "CSV Files (*.csv)"
+        )
+        if not path:
+            return
+        try:
+            _parse_base_ecef_csv(path)
+        except ValueError as exc:
+            self._show_message(
+                QMessageBox.Critical, "Invalid Base Position CSV",
+                f"The selected file does not match the required format:\n\n{exc}\n\n"
+                f"Expected columns: {', '.join(_BASE_ECEF_EXPECTED_HEADERS)}"
+            )
+            self._manual_base_csv_path = None
+            if self._manual_base_csv_label:
+                self._manual_base_csv_label.setText("No corrected base position CSV selected")
+                self._manual_base_csv_label.setStyleSheet(
+                    "color: #eaf6fa; background: transparent; border: none; padding: 2px;"
+                )
+            return
+        self._manual_base_csv_path = path
+        if self._manual_base_csv_label:
+            self._manual_base_csv_label.setText(os.path.basename(path))
+            self._manual_base_csv_label.setStyleSheet(
+                "color: #5cdb95; background: transparent; border: none; padding: 2px;"
+            )
+
     def _open_epsg_lookup(self):
         dlg = EPSGLookupDialog(self)
         if dlg.exec_() == QDialog.Accepted and dlg.selected_h_code:
@@ -2552,14 +2764,26 @@ class DataIntakeUI(QMainWindow):
             return
 
         self.epsg_h_input.setText(epsg_code)
+
+        # Look up the matching vertical EPSG from the zone table and apply it,
+        # mirroring what the manual EPSG lookup dialog does on accept.
+        v_code = next(
+            (row[3] for row in EPSGLookupDialog._SPCZONE if row[2] == epsg_code),
+            None
+        )
+        if v_code and self.epsg_v_input:
+            self.epsg_v_input.setText(v_code)
+
         msg = QMessageBox(self)
         msg.setIcon(QMessageBox.Information)
         msg.setWindowTitle("Zone Detected")
+        v_line = f"EPSG-V:  {v_code}" if v_code else "EPSG-V:  (not found — check manually)"
         msg.setText(
             f"Source:  {source_desc}\n"
             f"Coords:  {lat:.5f}°N   {lon:.5f}°E\n\n"
             f"Zone:    {zone_name}\n"
-            f"EPSG:    {epsg_code}"
+            f"EPSG-H:  {epsg_code}\n"
+            f"{v_line}"
         )
         msg.setStyleSheet(Styles.MESSAGEBOX)
         msg.exec_()
@@ -2821,12 +3045,14 @@ class DataIntakeUI(QMainWindow):
             )
             return
 
+        no_targets = bool(self._no_targets_check and self._no_targets_check.isChecked())
         if (self.dji_terra_toggle and self.dji_terra_toggle.isChecked()
+                and not no_targets
                 and self.gcp_path_input and not self.gcp_path_input.text().strip()):
             self._show_message(
                 QMessageBox.Warning, "GCP File Required",
                 "A GCP .csv file is required when 'DJI Automate — LiDAR reconstruction' is enabled.\n\n"
-                "Please select a GCP file before starting intake."
+                "Check 'No Targets' to run without a GCP file, or select a GCP file."
             )
             return
         
@@ -2842,6 +3068,24 @@ class DataIntakeUI(QMainWindow):
             self._show_message(QMessageBox.Critical, "Sensor Not Detected", error_msg)
             return
 
+        # Validate manual base position CSV if enabled
+        base_ecef_xyz: Optional[Tuple[float, float, float]] = None
+        if self._manual_base_check and self._manual_base_check.isChecked():
+            if not self._manual_base_csv_path:
+                self._show_message(
+                    QMessageBox.Warning, "Base Position CSV Required",
+                    "Manual base processing is enabled but no CSV file has been selected.\n\n"
+                    "Click 'Browse CSV' to choose your corrected base position file."
+                )
+                return
+            try:
+                base_ecef_xyz = _parse_base_ecef_csv(self._manual_base_csv_path)
+            except ValueError as exc:
+                self._show_message(
+                    QMessageBox.Critical, "Invalid Base Position CSV", str(exc)
+                )
+                return
+
         # Start worker
         self.start_btn.setEnabled(False)
         self.start_btn.setText("Processing...")
@@ -2849,6 +3093,7 @@ class DataIntakeUI(QMainWindow):
         self.processing_worker = ProcessingWorker(
             self.selected_folder, self.data_source_folders, self.base_data_paths,
             client, project, result.sensor_choice, self.base_data_is_rinex,
+            base_ecef_xyz=base_ecef_xyz,
         )
         
         self.processing_worker.file_copy_progress.connect(self._update_progress)
@@ -3027,15 +3272,37 @@ class DataIntakeUI(QMainWindow):
             if epsg_h:    cmd.extend(["--epsg-h",    epsg_h])
             if epsg_v:    cmd.extend(["--epsg-v",    epsg_v])
             if log_path:  cmd.extend(["--log-file",  log_path])
+            if self._no_targets_check and self._no_targets_check.isChecked():
+                cmd.append("--no-targets")
             dji_cmds.append(cmd)
 
         if dji_cmds:
+            self._pending_3dr_terra_folder = terra_folder
             self._setup_progress_bar(len(dji_cmds))
             self._update_status("Starting DJI automation sequence...")
             self._dji_thread = DJISequenceThread(dji_cmds, self)
             self._dji_thread.status_update.connect(self._update_status)
-            self._dji_thread.sequence_complete.connect(self._play_completion_sound)
+            self._dji_thread.sequence_complete.connect(self._on_dji_sequence_complete)
             self._dji_thread.start()
+
+    def _on_dji_sequence_complete(self):
+        """Called when DJI EXE sequence finishes. Starts 3DR classification if enabled."""
+        widget = self._classify_3dr_widget
+        terra  = self._pending_3dr_terra_folder
+        if widget and widget.is_enabled and widget.selected_model and terra:
+            model = widget.selected_model
+            self._update_status(f"[3DR] Starting auto-classification — model: {model}")
+            self._classify_3dr_thread = Classify3DRThread(terra, model, self)
+            self._classify_3dr_thread.status_update.connect(self._update_status)
+            self._classify_3dr_thread.classification_complete.connect(
+                lambda *_: self._play_completion_sound()
+            )
+            self._classify_3dr_thread.finished.connect(
+                self._classify_3dr_thread.deleteLater
+            )
+            self._classify_3dr_thread.start()
+        else:
+            self._play_completion_sound()
 
     def _play_completion_sound(self):
         self._cleanup_progress_bar()

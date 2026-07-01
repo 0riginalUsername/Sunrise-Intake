@@ -4,6 +4,9 @@ All notable changes to the Data Intake application. Newest entries on top.
 Entries below the marker are appended automatically by `build.py` on each release.
 
 <!-- BUILD-LOG -->
+## v2.4.2 — 07/01/2026
+- Small UI changes
+
 ## v2.4.1 — 07/01/2026
 - Fixed 3dr classify bug
 

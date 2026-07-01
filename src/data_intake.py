@@ -57,7 +57,7 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.4.1"
+    APP_VERSION = "Data Intake v2.4.2"
     APP_BUILD_DATE = "07/01/2026"
     
     # Paths
@@ -1915,6 +1915,7 @@ class DataIntakeUI(QMainWindow):
         self._classify_3dr_thread = None
         self._pending_3dr_terra_folder = None
         self._pending_3dr_project_name = None
+        self._scroll_content = None
         self.gcp_path_input = None
         self.epsg_h_input = None
         self.epsg_v_input = None
@@ -1988,10 +1989,10 @@ class DataIntakeUI(QMainWindow):
         screen = QApplication.primaryScreen()
         if screen:
             avail = screen.availableGeometry()
-            width = max(900, min(1100, int(avail.width() * 0.9)))
-            height = max(700, min(900, int(avail.height() * 0.9)))
+            width  = max(900, min(1100, int(avail.width() * 0.9)))
+            height = avail.height() - 40
             x = avail.x() + (avail.width() - width) // 2
-            y = avail.y() + (avail.height() - height) // 2
+            y = avail.y() + 40
             self.setGeometry(x, y, width, height)
         else:
             self.setGeometry(50, 50, 1100, 900)
@@ -2033,6 +2034,7 @@ class DataIntakeUI(QMainWindow):
         scroll = QScrollArea()
         scroll.setWidgetResizable(True)
         scroll_content = QWidget()
+        self._scroll_content = scroll_content
         scroll.setWidget(scroll_content)
         self.scroll_layout = QVBoxLayout(scroll_content)
         self.scroll_layout.setAlignment(Qt.AlignLeft)

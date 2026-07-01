@@ -80,139 +80,6 @@ def find_laz_files(root: str) -> List[str]:
 
 
 # ---------------------------------------------------------------------------
-# Terra reconstruction wait helper
-# ---------------------------------------------------------------------------
-
-def _wait_for_terra_reconstruction(
-    status_cb=None,
-    poll_secs: int = 20,
-    timeout_hours: int = 8,
-    appear_timeout_secs: int = 600,
-) -> None:
-    """Block until DJI Terra finishes reconstruction.
-
-    While a reconstruction runs, DJI Terra shows a Text element whose Name starts
-    with 'Reconstruction in progress...'; that element changes/disappears when it
-    completes. We wait in two phases so the classifier never jumps the gun:
-
-      Phase 1 — confirm reconstruction actually STARTED (the in-progress text
-                appears). Without this, the very first poll can fire before Terra
-                has rendered the indicator and instantly (wrongly) conclude 'done'.
-      Phase 2 — wait until the in-progress text is gone for several CONSECUTIVE
-                checks. Transient UIA/connect failures are treated as 'keep
-                waiting', not 'finished', so a momentary hiccup can't end it early.
-
-    Matching is done with prefix regexes (window title contains 'DJI Terra', the
-    indicator Name starts with 'Reconstruction in progress') so small UI drift —
-    a percent suffix, trailing space, version in the title — can't break it.
-    """
-    try:
-        from pywinauto import Desktop
-    except ImportError:
-        if status_cb:
-            status_cb("[3DR] pywinauto not available — skipping reconstruction wait")
-        return
-
-    def _find_terra_window():
-        """Return the DJI Terra top-level window wrapper, or None.
-
-        Found among Chromium windows (class Chrome_WidgetWin_1) either by the window
-        title containing 'DJI Terra' or, failing that, by it containing the
-        'DJI Terra' document node — whose Name is stable regardless of the window
-        title (the reconstruction text lives under that document).
-        """
-        cands = Desktop(backend="uia").windows(class_name="Chrome_WidgetWin_1")
-        for w in cands:
-            try:
-                if "DJI Terra" in (w.window_text() or ""):
-                    return w
-            except Exception:
-                continue
-        for w in cands:
-            try:
-                for doc in w.descendants(control_type="Document"):
-                    if (doc.window_text() or "") == "DJI Terra":
-                        return w
-            except Exception:
-                continue
-        return None
-
-    def _in_progress():
-        """True = indicator present, False = confirmed absent, None = Terra unreachable."""
-        try:
-            w = _find_terra_window()
-            if w is None:
-                return None
-            for txt in w.descendants(control_type="Text"):
-                try:
-                    if (txt.window_text() or "").startswith("Reconstruction in progress"):
-                        return True
-                except Exception:
-                    continue
-            return False
-        except Exception:
-            return None
-
-    # --- Phase 1: wait for reconstruction to START (indicator appears) ---
-    appear_deadline = time.time() + appear_timeout_secs
-    started = False
-    while time.time() < appear_deadline:
-        if _in_progress() is True:
-            started = True
-            break
-        if status_cb:
-            status_cb("[3DR] Waiting for Terra reconstruction to start...")
-        time.sleep(5)
-
-    if not started:
-        if status_cb:
-            status_cb(
-                f"[3DR] Did not see 'Reconstruction in progress' within "
-                f"{appear_timeout_secs}s — assuming it already finished and proceeding."
-            )
-        return
-
-    if status_cb:
-        status_cb("[3DR] Reconstruction in progress — waiting for it to finish...")
-
-    # --- Phase 2: wait for reconstruction to COMPLETE (indicator gone) ---
-    deadline = time.time() + timeout_hours * 3600
-    start = time.time()
-    gone_streak = 0          # consecutive checks confirming the indicator is absent
-    unreachable_streak = 0   # consecutive checks Terra couldn't be reached at all
-    unreachable_limit = max(1, 300 // poll_secs)   # ~5 min of silence ⇒ Terra closed
-
-    while time.time() < deadline:
-        state = _in_progress()
-        if state is True:
-            gone_streak = 0
-            unreachable_streak = 0
-            elapsed_min = int((time.time() - start) / 60)
-            if status_cb:
-                status_cb(f"[3DR] Waiting for Terra reconstruction... ({elapsed_min}m elapsed)")
-        elif state is False:
-            unreachable_streak = 0
-            gone_streak += 1
-            if gone_streak >= 2:
-                if status_cb:
-                    status_cb("[3DR] Reconstruction complete.")
-                return
-        else:  # None — couldn't reach Terra this tick
-            gone_streak = 0
-            unreachable_streak += 1
-            if unreachable_streak >= unreachable_limit:
-                if status_cb:
-                    status_cb("[3DR] Terra window gone for several minutes — assuming reconstruction ended.")
-                return
-            if status_cb:
-                status_cb("[3DR] Terra UI busy/unreachable — still waiting...")
-        time.sleep(poll_secs)
-
-    if status_cb:
-        status_cb(f"[3DR] Warning: timed out waiting for reconstruction after {timeout_hours}h — proceeding anyway")
-
-
-# ---------------------------------------------------------------------------
 # Background thread
 # ---------------------------------------------------------------------------
 
@@ -228,10 +95,11 @@ class Classify3DRThread(QThread):
     status_update           = pyqtSignal(str)
     classification_complete = pyqtSignal(int, int)   # (succeeded, total)
 
-    def __init__(self, terra_folder: str, model_name: str, parent=None):
+    def __init__(self, terra_folder: str, model_name: str, project_name: str = "", parent=None):
         super().__init__(parent)
         self._terra_folder = terra_folder
         self._model_name   = model_name
+        self._project_name = project_name
 
     # ------------------------------------------------------------------
     # Internal helpers
@@ -248,7 +116,7 @@ class Classify3DRThread(QThread):
                  "--scriptAutorun",
                  "--silent",
                  f"--scriptParam={param}"],
-                timeout=300,
+                timeout=21600,  # 6 hours
             )
             return result.returncode == 0
         except subprocess.TimeoutExpired:
@@ -266,16 +134,21 @@ class Classify3DRThread(QThread):
     # ------------------------------------------------------------------
 
     def run(self):
-        # Wait for DJI Terra to finish reconstruction before scanning for output files
-        self.status_update.emit("[3DR] Waiting for DJI Terra reconstruction to complete...")
-        _wait_for_terra_reconstruction(status_cb=self.status_update.emit)
-        self.status_update.emit("[3DR] Reconstruction complete — scanning for LAZ/LAS files...")
 
-        laz_files = find_laz_files(self._terra_folder)
+        report_file = os.path.join(self._terra_folder, self._project_name, "lidars", "report", "report.md")
+        self.status_update.emit(f"[3DR] Waiting for: {report_file}")
+        while not os.path.isfile(report_file):
+            self.status_update.emit("[3DR] LiDAR not yet complete — checking again in 3 min...")
+            time.sleep(180)
+        self.status_update.emit("[3DR] report.md detected — LiDAR complete, scanning for LAZ files...")
+
+        laz_scan_root = os.path.join(self._terra_folder, self._project_name, "lidars", "terra_laz")
+        self.status_update.emit(f"[3DR] Scanning: {laz_scan_root}")
+        laz_files = find_laz_files(laz_scan_root)
         total     = len(laz_files)
 
         if total == 0:
-            self.status_update.emit("[3DR] No LAZ/LAS files found in Terra output folder.")
+            self.status_update.emit("[3DR] No LAZ/LAS files found in terra_laz folder.")
             self.classification_complete.emit(0, 0)
             return
 
@@ -387,3 +260,38 @@ class Classify3DRWidget(QWidget):
     @property
     def selected_model(self) -> str:
         return self.model_combo.currentText() if self.is_enabled else ""
+
+
+# ---------------------------------------------------------------------------
+# Dev mode — run directly: python classify_3dr.py
+# ---------------------------------------------------------------------------
+
+# vvv  Edit these three lines before running  vvv
+_DEV_TERRA_FOLDER   = r"D:\3dData\test"
+_DEV_PROJECT_NAME   = "LiDAR Point Cloud Project(1)"
+_DEV_MODEL_NAME     = "Heavy Construction UAV 2.0"
+# ^^^  Edit these three lines before running  ^^^
+
+if __name__ == "__main__":
+    import sys
+    from PyQt5.QtWidgets import QApplication
+
+    app = QApplication(sys.argv)
+
+    print("[DEV] classify_3dr.py — dev mode")
+    print(f"[DEV] Terra folder  : {_DEV_TERRA_FOLDER}")
+    print(f"[DEV] Project name  : {_DEV_PROJECT_NAME}")
+    print(f"[DEV] Model         : {_DEV_MODEL_NAME}")
+    print("-" * 60)
+
+    thread = Classify3DRThread(_DEV_TERRA_FOLDER, _DEV_MODEL_NAME, project_name=_DEV_PROJECT_NAME)
+    thread.status_update.connect(print)
+    thread.classification_complete.connect(
+        lambda ok, total: (
+            print(f"\n[DEV] Done — {ok}/{total} files classified successfully."),
+            app.quit(),
+        )
+    )
+    thread.start()
+
+    sys.exit(app.exec_())

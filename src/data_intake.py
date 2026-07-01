@@ -57,8 +57,8 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.3.1"
-    APP_BUILD_DATE = "06/29/2026"
+    APP_VERSION = "Data Intake v2.4.1"
+    APP_BUILD_DATE = "07/01/2026"
     
     # Paths
     LAST_FOLDER_FILE = os.path.join(
@@ -1914,6 +1914,7 @@ class DataIntakeUI(QMainWindow):
         self._classify_3dr_widget = None
         self._classify_3dr_thread = None
         self._pending_3dr_terra_folder = None
+        self._pending_3dr_project_name = None
         self.gcp_path_input = None
         self.epsg_h_input = None
         self.epsg_v_input = None
@@ -3278,6 +3279,7 @@ class DataIntakeUI(QMainWindow):
 
         if dji_cmds:
             self._pending_3dr_terra_folder = terra_folder
+            self._pending_3dr_project_name = f"{client}_{project}_{date}_LiDAR"
             self._setup_progress_bar(len(dji_cmds))
             self._update_status("Starting DJI automation sequence...")
             self._dji_thread = DJISequenceThread(dji_cmds, self)
@@ -3287,12 +3289,13 @@ class DataIntakeUI(QMainWindow):
 
     def _on_dji_sequence_complete(self):
         """Called when DJI EXE sequence finishes. Starts 3DR classification if enabled."""
-        widget = self._classify_3dr_widget
-        terra  = self._pending_3dr_terra_folder
-        if widget and widget.is_enabled and widget.selected_model and terra:
+        widget        = self._classify_3dr_widget
+        terra         = self._pending_3dr_terra_folder
+        project_name  = self._pending_3dr_project_name
+        if widget and widget.is_enabled and widget.selected_model and terra and project_name:
             model = widget.selected_model
             self._update_status(f"[3DR] Starting auto-classification — model: {model}")
-            self._classify_3dr_thread = Classify3DRThread(terra, model, self)
+            self._classify_3dr_thread = Classify3DRThread(terra, model, project_name=project_name, parent=self)
             self._classify_3dr_thread.status_update.connect(self._update_status)
             self._classify_3dr_thread.classification_complete.connect(
                 lambda *_: self._play_completion_sound()

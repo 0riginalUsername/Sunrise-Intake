@@ -106,27 +106,93 @@ class Classify3DRThread(QThread):
     # ------------------------------------------------------------------
 
     def _classify_one(self, path: str) -> bool:
-        """Run ClassifyLAZ.js on a single file. Returns True on success."""
-        js_path = path.replace("\\", "\\\\")
-        param   = f"var inputFile='{js_path}'; var modelName='{self._model_name}';"
+        """Run ClassifyLAZ.js on a single file. Returns True on success.
+
+        Completion is detected by watching for the output .3dr file rather
+        than waiting for 3DR.exe to exit — Exit(0) in the JS is unreliable
+        and the process can stay open indefinitely.
+        """
+        js_path     = path.replace("\\", "\\\\")
+        param       = f"var inputFile='{js_path}'; var modelName='{self._model_name}';"
+        output_3dr  = os.path.splitext(path)[0] + ".3dr"
+        poll_secs   = 10
+        max_wait    = 21600  # 6 hours
+
+        # IMPORTANT: use DEVNULL, not inherited stdout/stderr (or PIPE without a
+        # reader). If 3DR.exe inherits a pipe handle from this process's own
+        # ancestry that nobody is actively draining, it deadlocks the instant
+        # it writes enough output to fill the ~64KB pipe buffer — no crash, no
+        # exit, it just sits there forever. Large files are more likely to hit
+        # this since they produce more internal logging.
+        proc = subprocess.Popen(
+            [CYCLONE_3DR_EXE,
+             f"--Script={CLASSIFY_SCRIPT}",
+             "--scriptAutorun",
+             "--silent",
+             f"--scriptParam={param}"],
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
+        )
+
+        heartbeat_secs = 300  # log a liveness line every 5 min while nothing else is happening
+        next_heartbeat = heartbeat_secs
+
         try:
-            result = subprocess.run(
-                [CYCLONE_3DR_EXE,
-                 f"--Script={CLASSIFY_SCRIPT}",
-                 "--scriptAutorun",
-                 "--silent",
-                 f"--scriptParam={param}"],
-                timeout=21600,  # 6 hours
-            )
-            return result.returncode == 0
-        except subprocess.TimeoutExpired:
-            self.status_update.emit(
-                f"[3DR] Timed out: {os.path.basename(path)}"
-            )
+            elapsed = 0
+            while elapsed < max_wait:
+                # Process exited on its own (Exit(0) worked)
+                if proc.poll() is not None:
+                    return os.path.isfile(output_3dr)
+
+                if elapsed >= next_heartbeat:
+                    self.status_update.emit(
+                        f"[3DR] Still waiting on {os.path.basename(path)} "
+                        f"({elapsed // 60}m elapsed, 3DR still running)"
+                    )
+                    next_heartbeat += heartbeat_secs
+
+                # Output file detected — wait for it to finish writing before closing 3DR
+                if os.path.isfile(output_3dr):
+                    self.status_update.emit(
+                        f"[3DR] Output detected, waiting for file to finish writing: {os.path.basename(output_3dr)}"
+                    )
+                    prev_size = -1
+                    stable_checks = 0
+                    while elapsed < max_wait:
+                        time.sleep(poll_secs)
+                        elapsed += poll_secs
+                        try:
+                            curr_size = os.path.getsize(output_3dr)
+                        except OSError:
+                            curr_size = -1
+                        if curr_size == prev_size and curr_size > 0:
+                            stable_checks += 1
+                            if stable_checks >= 2:  # stable for 2 consecutive checks (~20s)
+                                break
+                        else:
+                            stable_checks = 0
+                        prev_size = curr_size
+                        self.status_update.emit(
+                            f"[3DR] Writing... {curr_size // (1024*1024)} MB"
+                        )
+                    proc.terminate()
+                    proc.wait(timeout=15)
+                    return True
+
+                time.sleep(poll_secs)
+                elapsed += poll_secs
+
+            # Timed out
+            self.status_update.emit(f"[3DR] Timed out: {os.path.basename(path)}")
+            proc.terminate()
+            proc.wait(timeout=15)
         except Exception as exc:
-            self.status_update.emit(
-                f"[3DR] Error on {os.path.basename(path)}: {exc}"
-            )
+            self.status_update.emit(f"[3DR] Error on {os.path.basename(path)}: {exc}")
+            try:
+                proc.terminate()
+            except Exception:
+                pass
+
         return False
 
     # ------------------------------------------------------------------
@@ -145,10 +211,31 @@ class Classify3DRThread(QThread):
         laz_scan_root = os.path.join(self._terra_folder, self._project_name, "lidars", "terra_laz")
         self.status_update.emit(f"[3DR] Scanning: {laz_scan_root}")
         laz_files = find_laz_files(laz_scan_root)
-        total     = len(laz_files)
 
-        if total == 0:
+        if not laz_files:
             self.status_update.emit("[3DR] No LAZ/LAS files found in terra_laz folder.")
+            self.classification_complete.emit(0, 0)
+            return
+
+        _8GB = 8 * 1024 ** 3
+        merged = next((p for p in laz_files if os.path.basename(p).lower() == "cloud_merged.laz"), None)
+        if merged is not None:
+            merged_size = os.path.getsize(merged)
+            merged_gb   = merged_size / 1024 ** 3
+            if merged_size < _8GB:
+                self.status_update.emit(
+                    f"[3DR] cloud_merged.laz is {merged_gb:.2f} GB (<8 GB) — classifying merged only."
+                )
+                laz_files = [merged]
+            else:
+                self.status_update.emit(
+                    f"[3DR] cloud_merged.laz is {merged_gb:.2f} GB (≥8 GB) — skipping merged, classifying tiles only."
+                )
+                laz_files = [p for p in laz_files if p != merged]
+
+        total = len(laz_files)
+        if total == 0:
+            self.status_update.emit("[3DR] No files to classify after size filter.")
             self.classification_complete.emit(0, 0)
             return
 
@@ -274,6 +361,8 @@ _DEV_MODEL_NAME     = "Heavy Construction UAV 2.0"
 
 if __name__ == "__main__":
     import sys
+    import threading
+    import msvcrt
     from PyQt5.QtWidgets import QApplication
 
     app = QApplication(sys.argv)
@@ -282,7 +371,19 @@ if __name__ == "__main__":
     print(f"[DEV] Terra folder  : {_DEV_TERRA_FOLDER}")
     print(f"[DEV] Project name  : {_DEV_PROJECT_NAME}")
     print(f"[DEV] Model         : {_DEV_MODEL_NAME}")
+    print("[DEV] Press Q to quit at any time.")
     print("-" * 60)
+
+    def _watch_for_quit():
+        while True:
+            key = msvcrt.getch()
+            if key.lower() == b"q":
+                print("\n[DEV] Q pressed — exiting.")
+                app.quit()
+                break
+
+    quit_watcher = threading.Thread(target=_watch_for_quit, daemon=True)
+    quit_watcher.start()
 
     thread = Classify3DRThread(_DEV_TERRA_FOLDER, _DEV_MODEL_NAME, project_name=_DEV_PROJECT_NAME)
     thread.status_update.connect(print)

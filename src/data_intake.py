@@ -57,8 +57,8 @@ Image.MAX_IMAGE_PIXELS = None
 class Config:
     """Centralized application configuration."""
     
-    APP_VERSION = "Data Intake v2.4.2"
-    APP_BUILD_DATE = "07/01/2026"
+    APP_VERSION = "Data Intake v2.5"
+    APP_BUILD_DATE = "07/13/2026"
     
     # Paths
     LAST_FOLDER_FILE = os.path.join(
@@ -109,6 +109,11 @@ class Config:
     UNWANTED_PPK_EXTENSIONS = {".LDR", ".DBG", ".LDRT"}
     DJI_AUTOMATE_EXE     = r"Z:\Survey\UT\_Scripts\Automate UI\dist\DJI_AUTOMATE_UI.exe"
     DJI_AUTOMATE_PPK_EXE = r"Z:\Survey\UT\_Scripts\Automate UI\dist\DJI_AUTOMATE_PPK.exe"
+    # AutomatePix4D isn't built into an exe (see Automate UI/build.py — it's a "commit"
+    # target only, still under active dev via --dev/--step), so it's launched as a
+    # script via the Windows Python launcher rather than run as a standalone exe.
+    PIX4D_AUTOMATE_SCRIPT = r"Z:\Survey\UT\_Scripts\Automate UI\AutomatePix4D.py"
+    PY_LAUNCHER = "py"
 
 
 class Styles:
@@ -623,6 +628,36 @@ def _parse_base_ecef_csv(path: str) -> Tuple[float, float, float]:
         raise
     except Exception as exc:
         raise ValueError(f"Could not read CSV: {exc}") from exc
+
+
+def _export_tlt_tat_reference_csv(gcp_csv_path: str, dest_dir: str) -> Optional[str]:
+    """Reference-only export: rows from the GCP CSV whose column E is TLT or TAT,
+    written to TLT-TAT.csv in dest_dir. Not consumed by any automation script —
+    SINGLE_TLT.csv (TLT-only) is still generated independently by AutomatePix4D.py
+    and PyAutomateDJI.py."""
+    rows = []
+    try:
+        with open(gcp_csv_path, newline="", encoding="utf-8-sig") as fh:
+            for row in csv.reader(fh):
+                if len(row) >= 5 and row[4].strip().upper() in ("TLT", "TAT"):
+                    rows.append(row)
+    except Exception as e:
+        print(f"Failed to read GCP CSV for TLT-TAT export: {e}")
+        return None
+
+    if not rows:
+        print(f"No TLT/TAT rows found in {gcp_csv_path} — skipping TLT-TAT.csv export")
+        return None
+
+    out_path = os.path.join(dest_dir, "TLT-TAT.csv")
+    try:
+        with open(out_path, "w", newline="", encoding="utf-8") as fh:
+            csv.writer(fh).writerows(rows)
+        print(f"Exported {len(rows)} TLT/TAT row(s) -> {out_path}")
+        return out_path
+    except Exception as e:
+        print(f"Failed to write TLT-TAT.csv: {e}")
+        return None
 
 
 def _gps_from_rinex(rinex_path: str) -> Optional[Tuple[float, float]]:
@@ -1908,6 +1943,7 @@ class DataIntakeUI(QMainWindow):
         self.start_btn = None
         self.dji_terra_toggle = None
         self.dji_ppk_toggle = None
+        self.pix4d_toggle = None
         self._dji_box = None
         self._dji_details = None
         self._dji_thread = None
@@ -2253,7 +2289,7 @@ class DataIntakeUI(QMainWindow):
         inner.setSpacing(4)
 
         # Header
-        header = QLabel("DJI Terra Parameters")
+        header = QLabel("Automation Parameters")
         header.setFont(QFont("Segoe UI", 12, QFont.Bold))
         header.setStyleSheet("color: #113e59; background: transparent;")
         header.setAlignment(Qt.AlignHCenter)
@@ -2268,7 +2304,9 @@ class DataIntakeUI(QMainWindow):
         toggle_row.addWidget(self.dji_terra_toggle)
         inner.addLayout(toggle_row)
         self.dji_terra_toggle.stateChanged.connect(
-            lambda state: self._gcp_section.setVisible(bool(state))
+            lambda state: self._gcp_section.setVisible(
+                bool(state) or bool(self.pix4d_toggle and self.pix4d_toggle.isChecked())
+            )
         )
 
         toggle_row2 = QHBoxLayout()
@@ -2278,6 +2316,19 @@ class DataIntakeUI(QMainWindow):
         self.dji_ppk_toggle.setStyleSheet("color: #113e59;")
         toggle_row2.addWidget(self.dji_ppk_toggle)
         inner.addLayout(toggle_row2)
+
+        toggle_row3 = QHBoxLayout()
+        toggle_row3.setAlignment(Qt.AlignHCenter)
+        self.pix4d_toggle = QCheckBox("Pix4D Automate — Photogrammetry")
+        self.pix4d_toggle.setFont(QFont("Segoe UI", 11))
+        self.pix4d_toggle.setStyleSheet("color: #113e59;")
+        toggle_row3.addWidget(self.pix4d_toggle)
+        inner.addLayout(toggle_row3)
+        self.pix4d_toggle.stateChanged.connect(
+            lambda state: self._gcp_section.setVisible(
+                bool(state) or bool(self.dji_terra_toggle and self.dji_terra_toggle.isChecked())
+            )
+        )
 
         # GCP section — only visible when LiDAR toggle is checked
         self._gcp_section = QWidget()
@@ -2979,10 +3030,11 @@ class DataIntakeUI(QMainWindow):
         dlg.exec_()
 
     def _dji_auto_active(self) -> bool:
-        """True when either DJI automation checkbox is checked (autonomous run in progress)."""
+        """True when any automation checkbox is checked (autonomous run in progress)."""
         return (
             bool(self.dji_terra_toggle and self.dji_terra_toggle.isChecked()) or
-            bool(self.dji_ppk_toggle   and self.dji_ppk_toggle.isChecked())
+            bool(self.dji_ppk_toggle   and self.dji_ppk_toggle.isChecked()) or
+            bool(self.pix4d_toggle     and self.pix4d_toggle.isChecked())
         )
 
     def _show_message(self, icon, title: str, text: str):
@@ -3049,12 +3101,14 @@ class DataIntakeUI(QMainWindow):
             return
 
         no_targets = bool(self._no_targets_check and self._no_targets_check.isChecked())
-        if (self.dji_terra_toggle and self.dji_terra_toggle.isChecked()
+        if (((self.dji_terra_toggle and self.dji_terra_toggle.isChecked())
+                or (self.pix4d_toggle and self.pix4d_toggle.isChecked()))
                 and not no_targets
                 and self.gcp_path_input and not self.gcp_path_input.text().strip()):
             self._show_message(
                 QMessageBox.Warning, "GCP File Required",
-                "A GCP .csv file is required when 'DJI Automate — LiDAR reconstruction' is enabled.\n\n"
+                "A GCP .csv file is required when 'DJI Automate — LiDAR reconstruction' or "
+                "'Pix4D Automate — Photogrammetry' is enabled.\n\n"
                 "Check 'No Targets' to run without a GCP file, or select a GCP file."
             )
             return
@@ -3232,6 +3286,9 @@ class DataIntakeUI(QMainWindow):
         epsg_h = self.epsg_h_input.text().strip()   if self.epsg_h_input   else ""
         epsg_v = self.epsg_v_input.text().strip()   if self.epsg_v_input   else ""
 
+        if gcp and os.path.isfile(gcp):
+            _export_tlt_tat_reference_csv(gcp, date_path)
+
         # Resolve the actual DJI flight subfolder — intake copies each source as
         # sensor_path/<folder_name>/, so pass that specific subfolder to DJI Terra
         try:
@@ -3262,6 +3319,21 @@ class DataIntakeUI(QMainWindow):
             if epsg_h:    cmd.extend(["--epsg-h",    epsg_h])
             if epsg_v:    cmd.extend(["--epsg-v",    epsg_v])
             if log_path:  cmd.extend(["--log-file",  log_path])
+            dji_cmds.append(cmd)
+
+        # Pix4D imports the PPK-corrected/geotagged images, so it runs after the PPK step above.
+        if self.pix4d_toggle and self.pix4d_toggle.isChecked():
+            cmd = [
+                Config.PY_LAUNCHER, Config.PIX4D_AUTOMATE_SCRIPT,
+                "--project-name", f"{client}_{project}_{date}",
+                "--project-root", date_path,
+            ]
+            if epsg_h:    cmd.extend(["--epsg-h",    epsg_h])
+            if epsg_v:    cmd.extend(["--epsg-v",    epsg_v])
+            if gcp:       cmd.extend(["--gcp-path",  gcp])
+            if log_path:  cmd.extend(["--log-file",  log_path])
+            if self._no_targets_check and self._no_targets_check.isChecked():
+                cmd.append("--no-targets")
             dji_cmds.append(cmd)
 
         if self.dji_terra_toggle and self.dji_terra_toggle.isChecked():
